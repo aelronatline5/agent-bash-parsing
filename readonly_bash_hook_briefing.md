@@ -1,284 +1,139 @@
-# Briefing: Read-Only Bash Hook for Claude Code
+# Read-Only Bash Hook for Claude Code
 
-## Goal
+---
 
-Build a Claude Code hook (Python) that auto-approves Bash tool uses when the entire command is strictly read-only. Non-read-only commands fall through silently to the normal user prompt — never hard-denied. The hook supports both `PreToolUse` and `PermissionRequest` events via a single script that auto-detects the event type from stdin.
+# Part 1 — User Guide
+
+## What this is
+
+A Claude Code hook (Python) that auto-approves Bash commands when they are strictly read-only. Non-read-only commands fall through silently to the normal user prompt — never hard-denied.
+
+**Zero-config works.** Install the hook and it immediately approves common read-only commands (`ls`, `cat`, `grep`, `find`, `sort`, `wc`, `jq`, `rg`, `git log`, etc.) while leaving everything else to the interactive prompt.
+
+## Install
+
+```bash
+pip install bashlex
+cp readonly_bash_hook.py ~/.claude/hooks/
+cp readonly_bash_config.py ~/.claude/hooks/   # optional — only if customizing
+```
+
+Wire in `.claude/settings.json` or `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PermissionRequest": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/hooks/readonly_bash_hook.py"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Alternatively, wire to `PreToolUse` instead (see Part 2 for the difference).
+
+## What gets auto-approved
+
+- Simple read-only commands: `ls -la`, `cat file.txt`, `grep pattern file`
+- Pipelines of read-only commands: `find . -name "*.py" | head -20 | sort`
+- Compound commands: `ls && cat file`, `grep foo bar || echo "not found"`
+- Control flow with safe bodies: `for f in *.txt; do cat "$f"; done`
+- Command/process substitution with safe inner commands: `diff <(sort a) <(sort b)`
+- `sed` without `-i`: `sed 's/foo/bar/' file` (read-only transform to stdout)
+- `find` without `-exec`/`-delete`: `find . -name "*.py" -type f`
+- `find -exec` with safe inner commands: `find . -exec grep foo {} \;`
+- `xargs` with safe inner commands: `ls | xargs wc -l`
+- Git read-only subcommands: `git log`, `git diff`, `git status`, `git blame`
+
+## What falls through to user prompt
+
+- Write commands: `rm`, `cp`, `mv`, `mkdir`, `touch`, `chmod`
+- Interpreters/shells: `python3`, `bash`, `node`, `perl`, `ruby`
+- Shell escape hatches: `eval`, `exec`, `source`, `sudo`
+- Output redirections: `ls > file.txt`, `echo foo >> bar`
+- `sed -i` (in-place editing)
+- `find -delete`, `find -fprint`
+- Git write subcommands: `git push`, `git commit`, `git merge`
+- `awk` (has `system()` for arbitrary execution — see `AWK_SAFE_MODE` below)
+- Anything not on the whitelist
+
+## Configuration (optional)
+
+Configuration is a Python module. Create `readonly_bash_config.py` next to the hook script, or skip it entirely for defaults.
+
+```python
+# readonly_bash_config.py — only set what you want to change
+
+# Add commands to the built-in whitelist
+EXTRA_COMMANDS = ["kubectl", "helm", "terraform", "gcloud"]
+
+# Remove commands from the built-in whitelist (if you disagree with a default)
+REMOVE_COMMANDS = []
+
+# Feature flags — opt into categories of safe writes
+GIT_LOCAL_WRITES = False   # allow git branch, tag, stash, add, config (local only)
+AWK_SAFE_MODE = False      # allow awk when program has no system()/pipes/redirects
+```
+
+That's it. Three knobs:
+1. **EXTRA_COMMANDS** — add domain-specific read-only tools to the whitelist
+2. **REMOVE_COMMANDS** — remove commands you consider unsafe
+3. **Feature flags** — opt into safe-write categories
+
+Everything else (never-approve list, wrapper commands, git subcommand classification, handler dispatch) is baked into the hook code. These are security invariants, not user preferences.
+
+## Debug logging
+
+Set `READONLY_HOOK_DEBUG` env var. Logs to `~/.claude/hooks/readonly_bash.log`.
+
+- `1` — decisions only (approved / fell-through and why)
+- `2` — fragment extraction details
+- `3` — full AST dump, config loading, each evaluation step
+
+---
+
+# Part 2 — Implementation Spec
+
+## Architecture overview
+
+```
+stdin (JSON) → detect event type → bail if not Bash
+  → pre-strip `time` keyword → bashlex.parse()
+  → recursive AST walk → flat list of CommandFragments
+  → evaluate every fragment (7-step pipeline)
+  → ALL pass? → emit event-appropriate approval JSON
+  → ANY fail? → exit 0, no output (fall through)
+```
 
 ## Hook event modes: PreToolUse vs PermissionRequest
 
 The permission evaluation order is: **PreToolUse → Deny rules → Allow rules → Ask rules → PermissionRequest → canUseTool**.
 
-The hook can be wired to either event. The core analysis logic (parse, walk, evaluate) is identical — only the output format and behavioral semantics differ:
+The hook auto-detects the event from `hook_event_name` in stdin JSON. Core logic is identical — only output format differs:
 
 | Aspect | PreToolUse | PermissionRequest |
 |---|---|---|
-| **When fires** | Before every Bash tool call, regardless of permissions | Only when a permission dialog would be shown |
+| **When fires** | Before every Bash tool call | Only when permission dialog would show |
 | **Approval output** | `hookSpecificOutput.permissionDecision: "allow"` | `hookSpecificOutput.decision.behavior: "allow"` |
 | **Decision values** | `"allow"` / `"deny"` / `"ask"` (3-way) | `"allow"` / `"deny"` (2-way) |
-| **Empty exit 0** | Falls through to permission system (deny/allow/ask rules still apply) | Shows the permission dialog to the user |
-| **Exit 2** | Blocks the tool call, stderr fed to Claude | Denies permission, stderr fed to Claude |
-| **Can modify input** | Yes, via `updatedInput` | Yes, via `decision.updatedInput` |
-| **Extra stdin fields** | `tool_use_id` | `permission_suggestions` |
+| **Empty exit 0** | Falls through to permission system | Shows permission dialog |
+| **Exit 2** | Blocks tool call, stderr fed to Claude | Denies permission, stderr fed to Claude |
 
-### Which to choose
+**PermissionRequest** (recommended): fires only when declarative rules didn't resolve. Plays well with `permissions.allow`/`permissions.deny`. Less overhead.
 
-- **PermissionRequest** (recommended default): fires only when declarative rules didn't already resolve the decision. This means you can still use `permissions.deny` for hard blocks like `rm -rf *`, and `permissions.allow` for commands you always want approved. The hook handles only the nuanced compound-command analysis for everything that falls through. Less invocations, less overhead.
+**PreToolUse**: fires on every Bash call. Single source of truth, bypasses declarative rules for approved commands. More control, more invocations.
 
-- **PreToolUse**: fires on every Bash call. Useful if you want the hook to be the single source of truth for all Bash permissions, bypassing declarative rules entirely. The hook's `"allow"` decision skips all subsequent permission checks. More control, but more invocations and the hook must handle every Bash command (including those that declarative rules would have already handled).
+Do not wire to both events simultaneously (redundant).
 
-### Auto-detection
-
-The hook reads `hook_event_name` from the stdin JSON and formats its output accordingly. No config needed — wire it to whichever event you want (or both, though that's redundant).
-
-## Parser: bashlex (not shlex)
-
-`shlex.split()` is not sufficient — it tokenizes but doesn't understand shell structure. `bashlex` (pip package) produces a proper AST. Install with `pip install bashlex`.
-
-### AST node types we care about
-
-**Command-bearing nodes** (walker must recurse into these):
-- `CommandNode` — a single simple command. `.parts` contains `WordNode`, `RedirectNode`, `AssignmentNode` children.
-- `PipelineNode` — `cmd | cmd`. `.parts` contains `CommandNode` and `PipeNode` interleaved. May also contain `ReservedwordNode` for `!` negation (skip it).
-- `ListNode` — `cmd && cmd`, `cmd || cmd`, `cmd ; cmd`, `cmd &`. `.parts` contains `CommandNode` and `OperatorNode` interleaved.
-- `CompoundNode` — subshell `(...)` or brace group `{...}`. Has `.list` attribute containing inner nodes.
-- `ForNode` — `for x in ...; do ...; done`. Has `.parts` containing `ReservedwordNode`, `WordNode`, `ListNode`, and `CommandNode` children. Walker must recurse into `.parts`.
-- `WhileNode` — `while ...; do ...; done`. Has `.parts` containing condition and body commands. Walker must recurse into `.parts`.
-- `UntilNode` — `until ...; do ...; done`. Same structure as `WhileNode`.
-- `IfNode` — `if ...; then ...; fi`. Has `.parts` containing condition and body commands. Walker must recurse into `.parts`.
-- `FunctionNode` — `f() { ...; }`. Has `.name`, `.body` (a `CompoundNode`), and `.parts`. Walker MUST recurse into `.body` to evaluate all commands in the function definition. A function body containing non-read-only commands causes fall-through.
-- `CommandsubstitutionNode` — `$(...)`. Has `.command` attribute.
-- `ProcesssubstitutionNode` — `<(...)` or `>(...)`. Has `.command` attribute. Note: `>(...)` is an output channel (see evaluation logic step 1).
-
-**Leaf/structural nodes** (no recursion needed):
-- `WordNode` — a token. May itself contain nested `CommandsubstitutionNode`/`ProcesssubstitutionNode` in `.parts`.
-- `RedirectNode` — has `.type` (`>`, `>>`, `<`, `<<`, `<<<`, `>&`). Output redirects (`>`, `>>`) are the ones that matter for write detection. `>&` for fd duplication (e.g., `2>&1`) is NOT a file-writing redirect and is allowed.
-- `AssignmentNode` — `VAR=val` preceding a command.
-- `ReservedwordNode` — keywords like `for`, `do`, `done`, `if`, `then`, `fi`, `{`, `}`. Structural markers, skip.
-- `OperatorNode` — `;`, `&&`, `||`, `&`. Structural markers, skip.
-- `PipeNode` — `|` between pipeline stages. Structural marker, skip.
-- `ParameterNode` — `$var` or `${var}` inside words. Leaf, no action.
-- `TildeNode` — `~` expansion. Leaf, no action.
-- `HeredocNode` — heredoc content. Leaf, no action.
-
-### bashlex limitations discovered
-
-- `time` is a bash reserved word that bashlex raises `NotImplementedError` on (not `ParsingError`). Pre-strip `time` (and its flags like `-p`) from the front of the command string before feeding to bashlex. Note: step 2 strips the bash keyword `time` before parsing (because bashlex cannot handle it). Step 3 handles `time`/`/usr/bin/time` appearing as a wrapper command within already-parsed fragments. Both are needed.
-- `case` statements raise `NotImplementedError` (not `ParsingError`): `case $x in a) rm foo;; esac`.
-- `select` raises `NotImplementedError`: `select x in a b c; do echo $x; done`.
-- `coproc` raises `NotImplementedError`: `coproc cat`.
-- `$((arithmetic))` expansion raises `NotImplementedError`. Arithmetic is always safe but any command using it will fall through. Very common in bash — consider pre-replacing `$((` expressions with a placeholder before parsing.
-- `[[ ... ]]` extended test raises `ParsingError`. Security-safe (test expressions don't execute commands) but causes unnecessary fall-throughs for common constructs. Consider pre-replacing `[[ ... ]]` with `true` before parsing.
-- C-style `for (( i=0; i<10; i++ ))` raises `ParsingError`.
-- `(( x++ ))` arithmetic command is misparsed as nested subshells — accidentally safe (falls through) but unreliable.
-- Heredocs work but can be tricky with expansion. On any parse failure, fall through to user prompt.
-- Brace expansion in unusual positions may fail. Same approach — fall through.
-
-**Important**: bashlex raises two different exception types: `bashlex.errors.ParsingError` for unparseable input and `NotImplementedError` for recognized-but-unimplemented constructs. The hook MUST catch both (or catch `Exception` broadly) and fall through on either.
-
-## Architecture
-
-The hook reads JSON from stdin (Claude Code hook protocol), extracts `hook_event_name`, `tool_name`, and `tool_input.command`, then:
-
-1. **Bail early** if `tool_name != "Bash"`.
-2. **Pre-strip `time`** keyword (bashlex can't parse it).
-3. **Parse** with `bashlex.parse()`. On parse error → fall through.
-4. **Recursively walk** the AST to extract a flat list of `CommandFragment` objects, each with: executable name, args list, and whether it has output redirections.
-5. **Evaluate every fragment** against the config. ALL must pass for approval.
-6. **Output** the event-appropriate approval JSON on stdout + exit 0 if approved. The hook checks `hook_event_name` and formats the output as PreToolUse or PermissionRequest accordingly (see Hook protocol summary). Output nothing + exit 0 if any fragment fails (falls through).
-
-## Fragment evaluation logic (in order)
-
-1. **Output redirection check** — if fragment has `>` or `>>` redirect, reject. `>&` for fd duplication (e.g., `2>&1`) is NOT a file-writing redirect and is allowed. Input redirects (`<`, `<<`, `<<<`) and pipes are fine. Additionally, output process substitution `>(cmd)` is an output channel — the walker must flag it as such when encountered (in addition to recursing into the inner command).
-2. **Resolve basename** — `/usr/bin/ls` → `ls`.
-3. **Unwrap wrapper commands** — iteratively strip `env`, `nice`, `time`, `command`, `nohup`:
-   - `env`: skip `VAR=val` tokens and flags (`-i`, `-u NAME`, `-S`). `--` terminates flag processing; the next token after `--` is always the real executable.
-   - `nice`: skip flags (`-n 10`). `--` terminates flag processing.
-   - `time`: skip flags (`-p`). `--` terminates flag processing.
-   - `command`: if followed by `-v`/`-V`, approve immediately (it's a lookup). `-p` uses default PATH but still executes — strip it and continue unwrapping. `--` terminates flag processing.
-   - `nohup`: takes no flags, next token is the command.
-   - After stripping, the next token is the real executable.
-4. **Special-case `sed`** — reject if any arg is `-i`, starts with `-i`, is `--in-place`, starts with `--in-place=` (handles `--in-place=SUFFIX`), or is a combined short flag containing `i` (like `-ni`, `-Ei`). If no `-i` flag found, continue to step 10 (whitelist) for approval. Steps 4-6 are pre-filters: they only reject dangerous modes of otherwise-whitelisted commands. Approval comes from the whitelist at step 10.
-5. **Special-case `find`** — scan the argument list for:
-   - **Destructive actions** (`-delete`, `-fprint`, `-fprint0`, `-fprintf`): reject on sight, no inner command to inspect.
-   - **Exec actions** (`-exec`, `-execdir`, `-ok`, `-okdir`): extract the tokens between the action flag and its terminator (`;` or `+`). Strip placeholder tokens (`{}`) — these are path arguments, not commands. Feed the remaining tokens (command name + its args) through the same fragment evaluation logic used everywhere else. The inner command must pass the whitelist, never-approve list, and all other checks.
-   - Multiple exec blocks can be chained in a single `find` invocation (`find . -name "*.py" -exec grep foo {} \; -exec wc -l {} \;`). Each one is extracted and evaluated independently. ALL must pass.
-   - `find` with none of these flags (just predicates like `-name`, `-type`, `-mtime`, etc.) is purely read-only and approved as-is.
-6. **Special-case `xargs`** — strip known flags to find the inner command:
-   - **Flags with args** (consume next token): `-d`, `-a`, `-I`, `-L`, `-n`, `-P`, `-s`, `-E`, `--max-args`, `--max-procs`, `--max-chars`, `--delimiter`, `--arg-file`, `--replace`, `--max-lines`, `--eof`. Long flags also support `=` syntax (e.g., `--max-args=10`) — treat as a single token, do not consume the next token.
-   - **Flags without args** (skip): `-0`, `-r`, `-t`, `-p`, `-x`, `--null`, `--no-run-if-empty`, `--verbose`, `--interactive`, `--exit`, `--open-tty`.
-   - After stripping flags, the remaining tokens are the inner command + its args. Feed through the same fragment evaluation logic. The inner command must pass all checks.
-   - If no inner command remains after flag stripping, `xargs` defaults to `echo` — approve.
-7. **Special-case `awk`** (only if `awk_safe_mode` feature flag is enabled) — scan the awk program string for `system(`, `|` in print/pipe context, `>`, `>>`. Reject if found; approve if clean. If `awk_safe_mode` is disabled, awk falls through to step 8 (never-approve).
-8. **Never-approve list** — hard-reject interpreters, escape hatches, and commands with built-in code execution: `eval`, `exec`, `source`, `.`, `sudo`, `su`, `bash`, `sh`, `zsh`, `fish`, `dash`, `csh`, `ksh`, `python`, `python3`, `perl`, `ruby`, `node`, `deno`, `bun`, `parallel`, `awk`, `gawk`, `mawk`, `nawk` (awk only if `awk_safe_mode` is disabled).
-9. **Special-case `git`** — extract the subcommand (first non-flag arg after skipping git's global flags). Git global flags that consume an argument must have their values skipped: `-C <path>`, `-c <key=value>`, `--git-dir=<path>`, `--work-tree=<path>`, `--namespace=<name>`. Flags without arguments (`--no-pager`, `--bare`, `--no-replace-objects`) are simply skipped. If no subcommand is found (bare `git` or only flags), fall through. Evaluation depends on the `git_local_writes` feature flag:
-   - **Always approved** (strictly read-only): `blame`, `diff`, `log`, `ls-files`, `ls-tree`, `rev-parse`, `show`, `show-ref`, `status`.
-   - **Approved only if `git_local_writes` is enabled**: `branch`, `tag`, `remote`, `stash`, `add`, and `config` (with arg-level guard: reject if `--global` or `--system` present).
-   - **Always fall through**: `push`, `pull`, `fetch`, `commit`, `merge`, `rebase`, `reset`, `checkout`, `switch`, `restore`, `rm`, `clean`, `cherry-pick`, `revert`, `am`, `apply`, and anything not explicitly listed.
-10. **General whitelist check** — approve if executable basename is in `allowed_commands`.
-11. **Default** — not in whitelist → fall through.
-
-## Recursive walking details
-
-Command substitution (`$(rm -rf /)` inside `echo $(rm -rf /)`) and process substitution (`<(rm foo)` inside `cat <(rm foo)`) MUST be checked. These appear as nested nodes inside `WordNode.parts`. The walker must:
-
-- When processing a `CommandNode`, iterate its `.parts`. For each `WordNode` child, check if it has `.parts` containing substitution nodes, and recursively extract those.
-- When encountering `CompoundNode` (subshells/brace groups), walk `.list`.
-- When encountering `ForNode`, `WhileNode`, `UntilNode`, or `IfNode`, recurse into `.parts` to find and evaluate all contained `CommandNode`, `ListNode`, `PipelineNode`, and `CompoundNode` children.
-- When encountering `FunctionNode`, recurse into `.body` (a `CompoundNode`) and evaluate all commands within. A function body containing non-read-only commands causes fall-through.
-- When encountering `CommandsubstitutionNode` or `ProcesssubstitutionNode`, walk `.command`.
-- Skip leaf/structural nodes: `ReservedwordNode`, `OperatorNode`, `PipeNode`, `ParameterNode`, `TildeNode`, `HeredocNode`.
-
-### Default-deny rule (defense in depth)
-
-If the walker encounters any AST node kind it does not explicitly handle, it MUST force a fall-through rather than silently skipping it. This protects against both current omissions and future bashlex additions. The walker should maintain an explicit set of known node kinds and reject on anything outside that set.
-
-## Config file (JSON)
-
-Store separately from the hook script for easy editing. Contains:
-
-- `allowed_commands`: flat list of command basenames (ls, cat, grep, find, sort, wc, head, tail, jq, rg, fd, tree, stat, du, df, ps, etc.). Note: `sed`, `find`, `xargs` should be in this list — their special-case steps (4-6) only reject dangerous modes; approval comes from the whitelist at step 10. `git` must NOT appear in this list — its approval is handled entirely by step 9; adding it here would bypass subcommand checks.
-- `git_readonly_subcommands`: list of strictly read-only git subcommands (see git section)
-- `wrapper_commands`: list of prefix commands to unwrap (env, nice, time, command, nohup)
-- `never_approve`: list of commands that should never be auto-approved (interpreters, escape hatches). Can be hardcoded or configurable. See step 7.
-- `feature_flags`: object with boolean flags for opt-in safe-write categories (all default to false)
-- `version`: schema version number (start at `1`). The hook checks this on load and warns on unknown versions.
-
-### Example config
-
-```json
-{
-  "version": 1,
-  "allowed_commands": [
-    "ls", "cat", "grep", "sed", "find", "xargs", "sort", "wc", "head", "tail",
-    "jq", "rg", "fd", "tree", "stat", "du", "df", "ps", "file", "diff", "cmp",
-    "readlink", "realpath", "basename", "dirname", "which", "type", "whereis",
-    "id", "whoami", "groups", "uname", "hostname", "uptime", "printenv",
-    "cut", "paste", "tr", "uniq", "comm", "join", "fmt", "column", "nl", "tac", "rev",
-    "sha256sum", "sha1sum", "md5sum", "cksum", "xxd", "hexdump", "od",
-    "echo", "printf", "true", "false", "test", "[", "read", "strings", "locate"
-  ],
-  "git_readonly_subcommands": [
-    "blame", "diff", "log", "ls-files", "ls-tree", "rev-parse", "show", "show-ref", "status"
-  ],
-  "wrapper_commands": ["env", "nice", "time", "command", "nohup"],
-  "never_approve": [
-    "eval", "exec", "source", ".", "sudo", "su",
-    "bash", "sh", "zsh", "fish", "dash", "csh", "ksh",
-    "python", "python3", "perl", "ruby", "node", "deno", "bun",
-    "parallel", "awk", "gawk", "mawk", "nawk"
-  ],
-  "feature_flags": {
-    "git_local_writes": false,
-    "awk_safe_mode": false
-  }
-}
-```
-
-### Error handling
-
-- **Missing config file**: log a warning to stderr, fall through on all commands (exit 0, no output). The hook should never crash.
-- **Malformed JSON**: treat as missing config — fall through on everything.
-- **Unknown fields**: ignore silently (forward compatibility).
-- **Missing required fields**: use safe defaults — empty `allowed_commands` means nothing is approved, empty `never_approve` means nothing is hard-blocked. Missing `feature_flags` means all flags are `false`.
-- **Type errors** (e.g., `allowed_commands` is a string instead of list): treat as missing field, use default.
-
-## Feature flags
-
-The hook is strictly read-only by default. Feature flags opt into categories of low-risk, local, easily-reversible write operations. Each flag is a boolean in `config.feature_flags`, defaulting to `false` when absent.
-
-### `git_local_writes`
-
-When **disabled** (default): git evaluation only approves subcommands from `git_readonly_subcommands` — a strictly read-only list: `blame`, `diff`, `log`, `ls-files`, `ls-tree`, `rev-parse`, `show`, `show-ref`, `status`.
-
-When **enabled**: additionally approves these subcommands, which perform local-only writes that are trivially reversible:
-- `branch` — creates/deletes local branches. Never touches the remote.
-- `config` — writes local git config. Excludes `--global` and `--system` (those fall through).
-- `tag` — creates/deletes local tags. Never touches the remote.
-- `remote` — adds/removes remote definitions (local config only, no network).
-- `stash` — saves/restores working directory state. Always reversible.
-- `add` — stages files. Reversible with `git restore --staged`.
-
-Even with this flag enabled, the following always fall through: `push`, `pull`, `fetch`, `commit`, `merge`, `rebase`, `reset`, `checkout`, `switch`, `restore`, `rm`, `clean`, `cherry-pick`, `revert`, `am`, `apply`.
-
-### `git_local_writes` arg-level guards
-
-Some subcommands enabled by `git_local_writes` need arg-level checks to prevent non-local effects:
-- `git config`: reject if args contain `--global` or `--system` (these write outside the repo). `--local` and no scope flag are fine.
-
-### `awk_safe_mode`
-
-When **disabled** (default): `awk`/`gawk`/`mawk`/`nawk` are on the never-approve list (step 7). All `awk` invocations fall through to user prompt.
-
-When **enabled**: `awk` is removed from the never-approve list and instead gets a special-case evaluation (inserted between steps 6 and 7). The awk program argument (typically the first non-flag arg, or the arg after `-f`) is scanned for dangerous constructs:
-- **Reject** if the program contains: `system(`, `|` in a print/pipe context (`print ... |`, `... | getline`), `>` or `>>` (awk's built-in file output operators).
-- **Approve** if none of the above are found — the awk invocation is purely read-only (filtering/transforming to stdout).
-- This is a best-effort textual scan of the awk program string, not a full awk parser. On any doubt (e.g., obfuscated code, variables in redirection targets), fall through.
-
-Note: `awk -f script.awk` reads the program from a file, making static analysis impossible. This always falls through when `awk_safe_mode` is enabled.
-
-### Future feature flags (not yet implemented)
-
-Placeholders for future safe-write categories, to be designed as needed:
-- `allow_output_redirections` — allow `>` and `>>` to files (currently always rejected).
-- `network_reads` — allow read-only network commands like `curl -s` (GET only), `wget -O -`, `ping`, `dig`, `nslookup`, `host`.
-- `safe_file_writes` — allow low-risk file operations like `mkdir -p`, `touch` (create empty files only).
-
-### Commands on the whitelist with special handling
-
-- `sed` — on the whitelist, but `-i`/`--in-place` is special-cased to reject (step 4).
-- `find` — on the whitelist, but `-exec`/`-delete`/`-fprint` are special-cased (step 5).
-- `xargs` — on the whitelist, but inner command is extracted and evaluated (step 6). `xargs` with no inner command (defaults to `echo`) is approved.
-
-### Commands on the never-approve list (with rationale)
-
-These are handled at step 8 and always cause fall-through regardless of context:
-- `eval`, `exec`, `source`, `.` — shell escape hatches, can run anything.
-- `sudo`, `su` — privilege escalation.
-- `bash`, `sh`, `zsh`, `fish`, `dash`, `csh`, `ksh` — shell interpreters.
-- `python`, `python3`, `perl`, `ruby`, `node`, `deno`, `bun` — language interpreters.
-- `awk`, `gawk`, `mawk`, `nawk` — despite common use as text filters, `awk` has `system()` for arbitrary shell execution, can pipe to commands via `|`, and can write to files via its built-in `>` operator. Functionally an interpreter.
-- `parallel` — GNU parallel accepts shell snippet strings as commands, too flexible to parse reliably.
-
-Note: destructive commands like `rm`, `cp`, `mv` are NOT on the never-approve list. They are safely handled by simply not being on the whitelist (fall through at step 11). The never-approve list is specifically for commands that could bypass the safety model entirely (interpreters, privilege escalation, eval).
-
-### Commands intentionally excluded from the whitelist
-
-These are not on the whitelist and not on the never-approve list. They fall through at step 11:
-- `tee` — always writes to files by design.
-- `curl`, `wget` — network access, not read-only.
-- `cp`, `mv`, `rm`, `mkdir`, `touch`, `chmod`, `chown` — obvious writes.
-- `make`, `pip`, `npm`, `cargo`, `docker` — side-effecting build/install tools.
-- `dd` — can overwrite devices/files without shell-level redirections (`of=`).
-- `ln` — creates symlinks/hard links.
-- `install` — copies files with permissions.
-- `patch` — modifies files.
-- `truncate`, `shred` — destructive file operations.
-- `xdg-open`, `open` — launches external programs.
-- `date` — read-only without `-s`, but `date -s` sets the clock. Excluded for simplicity.
-- `tar` — list mode (`tar tf`) is read-only, but extract/create modes write. Excluded for simplicity.
-
-### Additional commands recommended for the whitelist
-
-Beyond the basics (`ls`, `cat`, `grep`, `find`, `sort`, `wc`, `head`, `tail`, `jq`, `rg`, `fd`, `tree`, `stat`, `du`, `df`, `ps`), consider:
-- **Text processing**: `sed`, `cut`, `paste`, `tr`, `uniq`, `comm`, `join`, `fmt`, `column`, `nl`, `tac`, `rev`, `fold`, `expand`, `unexpand`
-- **File info**: `file`, `readlink`, `realpath`, `basename`, `dirname`
-- **Diffing**: `diff`, `cmp`
-- **Command lookup**: `which`, `type`, `whereis`
-- **User/system info**: `id`, `whoami`, `groups`, `uname`, `hostname`, `uptime`, `printenv`
-- **Checksums**: `sha256sum`, `sha1sum`, `md5sum`, `cksum`, `b2sum`
-- **Binary viewers**: `xxd`, `hexdump`, `od`
-- **Builtins**: `echo`, `printf`, `true`, `false`, `test`, `[`, `read` (stdin-only)
-- **Search**: `locate`, `strings`
-
-## Hook protocol summary
-
-### Stdin (both events)
-
-JSON with: `session_id`, `cwd`, `permission_mode`, `hook_event_name`, `tool_name`, `tool_input`, `transcript_path`. PreToolUse additionally receives `tool_use_id`. PermissionRequest additionally receives `permission_suggestions`.
-
-The hook reads `hook_event_name` to determine which output format to use.
-
-### Stdout on exit 0 — approval output
+### Output formats
 
 **PreToolUse approval:**
 ```json
@@ -303,210 +158,456 @@ The hook reads `hook_event_name` to determine which output format to use.
 }
 ```
 
-### Fall-through (no approval)
-
-For both events: output nothing on stdout + exit 0.
-- **PreToolUse**: falls through to the permission system (deny/allow/ask rules still apply, then PermissionRequest if needed).
-- **PermissionRequest**: the interactive permission dialog is shown to the user.
+**Fall-through (both events):** output nothing, exit 0.
 
 ### Exit codes
 
-- **Exit 0**: success. Stdout parsed for JSON. If empty or no decision → fall through.
-- **Exit 2**: blocking error. Blocks/denies the tool call. stderr fed to Claude. We deliberately avoid this — all rejections fall through silently.
-- **Other (1, etc.)**: non-blocking error. stderr shown in verbose mode only. Falls through.
-- **Stderr**: ignored by Claude Code (unless exit 2), safe for debug logging.
+- **Exit 0**: success. Stdout parsed for JSON. Empty or no decision → fall through.
+- **Exit 2**: blocking error. Denies tool call, stderr fed to Claude. We avoid this — all rejections fall through silently.
+- **Other**: non-blocking error. stderr shown in verbose mode. Falls through.
 
-## Wiring
+## Parser: bashlex
 
-In `.claude/settings.json` or `~/.claude/settings.json`. Choose one:
+`shlex.split()` tokenizes but doesn't understand shell structure. `bashlex` produces a proper AST. Install: `pip install bashlex`.
 
-**Option A: PermissionRequest (recommended)** — fires only when declarative rules didn't resolve. Less overhead, plays well with `permissions.allow`/`permissions.deny`.
+### Pre-parse workarounds
 
-```json
-{
-  "hooks": {
-    "PermissionRequest": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 /absolute/path/to/readonly_bash_hook.py"
-          }
-        ]
-      }
-    ]
-  }
+bashlex has limitations. Before calling `bashlex.parse()`:
+
+1. **Strip `time` keyword** — bash reserved word, raises `NotImplementedError`. Strip `time` and its flags (`-p`) from the front of the command string.
+2. **Consider pre-replacing `$((...))`** — arithmetic expansion raises `NotImplementedError`. Always safe, but causes unnecessary fall-throughs. Replace with a placeholder literal.
+3. **Consider pre-replacing `[[ ... ]]`** — extended test raises `ParsingError`. Always safe. Replace with `true`.
+
+Other bashlex limitations (all fall through safely):
+- `case` statements → `NotImplementedError`
+- `select` → `NotImplementedError`
+- `coproc` → `NotImplementedError`
+- C-style `for (( ))` → `ParsingError`
+- `(( x++ ))` → misparsed (accidentally safe)
+
+**Important**: catch both `bashlex.errors.ParsingError` and `NotImplementedError` (or broadly `Exception`) and fall through on either.
+
+### AST node catalog
+
+**Command-bearing nodes** (walker must recurse):
+
+| Node | Structure | Recurse into |
+|---|---|---|
+| `CommandNode` | single command | `.parts` (contains WordNode, RedirectNode, AssignmentNode) |
+| `PipelineNode` | `cmd \| cmd` | `.parts` (CommandNode + PipeNode interleaved) |
+| `ListNode` | `cmd && cmd`, `cmd ; cmd` | `.parts` (CommandNode + OperatorNode interleaved) |
+| `CompoundNode` | `(...)` or `{...}` | `.list` |
+| `ForNode` | `for x in ...; do ...; done` | `.parts` |
+| `WhileNode` | `while ...; do ...; done` | `.parts` |
+| `UntilNode` | `until ...; do ...; done` | `.parts` |
+| `IfNode` | `if ...; then ...; fi` | `.parts` |
+| `FunctionNode` | `f() { ...; }` | `.body` (a CompoundNode) |
+| `CommandsubstitutionNode` | `$(...)` | `.command` |
+| `ProcesssubstitutionNode` | `<(...)` or `>(...)` | `.command` — also flag `>(...)` as output channel |
+
+**Leaf/structural nodes** (skip):
+
+`WordNode` (but check `.parts` for nested substitutions), `RedirectNode`, `AssignmentNode`, `ReservedwordNode`, `OperatorNode`, `PipeNode`, `ParameterNode`, `TildeNode`, `HeredocNode`.
+
+### Default-deny walker rule
+
+If the walker encounters any AST node kind not in an explicit set of known kinds, it MUST force fall-through. This protects against omissions and future bashlex additions.
+
+### Recursive walking details
+
+- `CommandNode`: iterate `.parts`. For each `WordNode`, check `.parts` for nested substitution nodes.
+- `CompoundNode`: walk `.list`.
+- `ForNode`, `WhileNode`, `UntilNode`, `IfNode`: recurse into `.parts`.
+- `FunctionNode`: recurse into `.body`. Non-read-only commands in body → fall-through.
+- `CommandsubstitutionNode`, `ProcesssubstitutionNode`: walk `.command`.
+
+The walker produces a flat list of `CommandFragment` objects, each with: executable name, args list, and output-redirection flag.
+
+## The 7-step evaluation pipeline
+
+Every `CommandFragment` is evaluated through these steps in order. ALL fragments must pass for the command to be approved.
+
+### Step 1 — REJECT (structural): output redirections
+
+If fragment has `>` or `>>` redirect → fall through. `>&` for fd duplication (e.g., `2>&1`) is NOT a file write — allowed. Input redirects (`<`, `<<`, `<<<`) and pipes are fine. Output process substitution `>(cmd)` is flagged by the walker as an output channel → fall through.
+
+### Step 2 — NORMALIZE: resolve and unwrap
+
+1. **Resolve basename**: `/usr/bin/ls` → `ls`.
+2. **Unwrap wrapper commands** — iteratively strip these (code constants, not configurable):
+   - `env`: skip `VAR=val` tokens and flags (`-i`, `-u NAME`, `-S`). `--` terminates flags.
+   - `nice`: skip flags (`-n 10`). `--` terminates flags.
+   - `time`: skip flags (`-p`). `--` terminates flags.
+   - `command`: if followed by `-v`/`-V` → approve immediately (lookup, not execution). `-p` stripped, continue unwrapping. `--` terminates flags.
+   - `nohup`: no flags, next token is the command.
+3. After stripping, the next token is the real executable. Loop back to resolve basename and check for another wrapper.
+
+### Step 3 — REJECT (unconditional): never-approve gate
+
+Hard-coded list (code constant, not configurable):
+
+```python
+NEVER_APPROVE = {
+    # Shell escape hatches
+    "eval", "exec", "source", ".",
+    # Privilege escalation
+    "sudo", "su",
+    # Shell interpreters
+    "bash", "sh", "zsh", "fish", "dash", "csh", "ksh",
+    # Language interpreters
+    "python", "python3", "perl", "ruby", "node", "deno", "bun",
+    # Too flexible to parse
+    "parallel",
+}
+# awk/gawk/mawk/nawk added here dynamically when AWK_SAFE_MODE is disabled
+```
+
+Rationale: these commands can bypass the safety model entirely. They are not merely "write commands" — they are interpreters and escape hatches. Destructive commands like `rm`, `cp`, `mv` are safely handled by simply not being on the whitelist (fall through at step 7).
+
+### Step 4 — REJECT (conditional): dangerous-modes handlers
+
+Commands that are on the whitelist but have modes that write. Dispatched via a handler registry:
+
+```python
+DANGEROUS_MODE_HANDLERS = {
+    "sed": handle_sed,
+    "find": handle_find,
+    "xargs": handle_xargs,
+    "awk": handle_awk,      # registered only when AWK_SAFE_MODE enabled
+    "gawk": handle_awk,
+    "mawk": handle_awk,
+    "nawk": handle_awk,
 }
 ```
 
-**Option B: PreToolUse** — fires on every Bash call. Single source of truth, bypasses declarative rules for approved commands.
+If a handler returns `REJECT` → fall through. If it returns `PASS` → continue to step 6 (whitelist check). If no handler exists for the command → skip to step 5.
 
-```json
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 /absolute/path/to/readonly_bash_hook.py"
-          }
-        ]
-      }
-    ]
-  }
+#### `handle_sed`
+
+Reject if any arg is `-i`, starts with `-i`, is `--in-place`, starts with `--in-place=`, or is a combined short flag containing `i` (like `-ni`, `-Ei`). Otherwise → PASS.
+
+#### `handle_find`
+
+Scan args for:
+- **Destructive actions** (`-delete`, `-fprint`, `-fprint0`, `-fprintf`): → REJECT.
+- **Exec actions** (`-exec`, `-execdir`, `-ok`, `-okdir`): extract tokens between the action flag and its terminator (`;` or `+`). Strip `{}` placeholders. Feed the remaining tokens (command + args) through the **same 7-step pipeline** recursively. Multiple exec blocks are evaluated independently. ALL must pass.
+- No dangerous flags → PASS.
+
+#### `handle_xargs`
+
+Strip known flags to find the inner command:
+- **Flags with args** (consume next token): `-d`, `-a`, `-I`, `-L`, `-n`, `-P`, `-s`, `-E`, `--max-args`, `--max-procs`, `--max-chars`, `--delimiter`, `--arg-file`, `--replace`, `--max-lines`, `--eof`. Long `=` syntax (`--max-args=10`) is a single token.
+- **Flags without args** (skip): `-0`, `-r`, `-t`, `-p`, `-x`, `--null`, `--no-run-if-empty`, `--verbose`, `--interactive`, `--exit`, `--open-tty`.
+
+After stripping, remaining tokens are the inner command + args. Feed through the **same 7-step pipeline**. If no inner command remains → defaults to `echo` → PASS.
+
+#### `handle_awk` (only when `AWK_SAFE_MODE` enabled)
+
+Scan the awk program string (first non-flag arg, or arg after `-f`) for:
+- `system(` → REJECT
+- `|` in print/pipe context (`print ... |`, `... | getline`) → REJECT
+- `>` or `>>` (awk's file output operators) → REJECT
+- `-f script.awk` (reads program from file, static analysis impossible) → REJECT
+- None of the above → PASS (purely read-only filtering/transforming to stdout)
+
+This is best-effort textual scan, not a full awk parser. On any doubt → REJECT.
+
+### Step 5 — APPROVE (domain): git subcommand evaluation
+
+If command is `git`: extract the subcommand (first non-flag arg after skipping git's global flags).
+
+Git global flags that consume an argument (skip both flag and value): `-C`, `-c`, `--git-dir`, `--work-tree`, `--namespace`. Flags without arguments (skip): `--no-pager`, `--bare`, `--no-replace-objects`. If no subcommand found → fall through.
+
+Classification (code constants):
+
+```python
+GIT_READONLY = {
+    "blame", "diff", "log", "ls-files", "ls-tree",
+    "rev-parse", "show", "show-ref", "status",
+}
+
+GIT_LOCAL_WRITES = {
+    "branch", "tag", "remote", "stash", "add",
+    "config",  # with arg-level guard: reject --global and --system
+}
+
+# Everything else (push, pull, fetch, commit, merge, rebase, reset,
+# checkout, switch, restore, rm, clean, cherry-pick, revert, am, apply)
+# always falls through.
+```
+
+- Subcommand in `GIT_READONLY` → APPROVE.
+- Subcommand in `GIT_LOCAL_WRITES` and `GIT_LOCAL_WRITES` flag enabled → APPROVE (with arg guard for `config`).
+- Otherwise → fall through.
+
+`git` must NOT appear on the general whitelist — its approval is handled entirely here.
+
+### Step 6 — APPROVE (general): whitelist check
+
+If executable basename is in the effective whitelist → APPROVE.
+
+The effective whitelist = `DEFAULT_COMMANDS + config.EXTRA_COMMANDS - config.REMOVE_COMMANDS`.
+
+```python
+DEFAULT_COMMANDS = {
+    # Filesystem listing
+    "ls", "tree", "stat", "file", "du", "df",
+    # File reading
+    "cat", "head", "tail", "less", "more", "tac",
+    # Search
+    "grep", "rg", "fd", "find", "locate", "strings", "ag",
+    # Text processing (read-only — sed -i handled by step 4)
+    "sed", "cut", "paste", "tr", "sort", "uniq", "comm", "join",
+    "fmt", "column", "nl", "rev", "fold", "expand", "unexpand",
+    "wc", "xargs",
+    # JSON/structured data
+    "jq", "yq",
+    # Diffing
+    "diff", "cmp",
+    # Path utilities
+    "readlink", "realpath", "basename", "dirname",
+    # Command lookup
+    "which", "type", "whereis",
+    # User/system info
+    "id", "whoami", "groups", "uname", "hostname", "uptime", "printenv",
+    # Checksums
+    "sha256sum", "sha1sum", "md5sum", "cksum", "b2sum",
+    # Binary viewers
+    "xxd", "hexdump", "od",
+    # Builtins
+    "echo", "printf", "true", "false", "test", "[", "read",
+    # Process info
+    "ps", "top", "htop", "lsof", "pgrep",
 }
 ```
 
-The same script handles both — it reads `hook_event_name` from stdin and formats the output accordingly. Do not wire to both events simultaneously (redundant; if PreToolUse approves, PermissionRequest never fires).
+### Step 7 — REJECT (default): fall through
 
-## Debug logging
+Not in whitelist → fall through to user prompt.
 
-Set `READONLY_HOOK_DEBUG` env var. Logs to `~/.claude/hooks/readonly_bash.log`. Never logs to stdout (that's the protocol channel).
-- `READONLY_HOOK_DEBUG=1` — decisions only (approved/fell-through and why).
-- `READONLY_HOOK_DEBUG=2` — fragment extraction details.
-- `READONLY_HOOK_DEBUG=3` — full AST dump, config loading, each evaluation step.
+## Config-as-code module
 
-## Performance considerations
+The hook imports `readonly_bash_config` (Python module next to the hook script). If the module doesn't exist → all defaults apply. If it exists but has missing attributes → defaults for those attributes.
 
-This hook fires on every Bash tool call that reaches the PermissionRequest stage. Each invocation spawns a new Python process.
+```python
+# In the hook:
+try:
+    import readonly_bash_config as cfg
+except ImportError:
+    cfg = None
 
-- **Python cold-start**: ~30-80ms for interpreter startup.
-- **bashlex import**: additional ~20-50ms.
-- **Config loading**: JSON read from disk on every invocation.
-- **bashlex.parse()**: negligible for typical commands (<1ms).
-- **Total per-invocation**: ~50-150ms, acceptable for interactive use.
+def get_config(attr, default):
+    return getattr(cfg, attr, default) if cfg else default
 
-For agentic sessions with many sequential Bash calls, this latency can add up. Potential optimizations if needed:
-- Use `#!/usr/bin/env python3 -S` to skip site-packages scan.
-- Pre-compile to `.pyc` via `py_compile` for faster loading.
-- For sub-10ms response, consider a persistent daemon (socket-based) or a compiled language (Go/Rust). This is likely over-engineering for the initial version.
+extra = set(get_config("EXTRA_COMMANDS", []))
+remove = set(get_config("REMOVE_COMMANDS", []))
+effective_whitelist = (DEFAULT_COMMANDS | extra) - remove
 
-## Test suite
+git_local_writes = get_config("GIT_LOCAL_WRITES", False)
+awk_safe_mode = get_config("AWK_SAFE_MODE", False)
+```
 
-~150 test cases covering: simple commands, pipelines, compound commands (&&, ||, ;), control flow (for, while, until, if), function definitions, git read-only vs write subcommands (parametrized with `git_local_writes` on/off), output vs input vs fd-duplication redirections, dangerous commands, shell interpreters, eval/exec, command substitution (including nested), process substitution (both `<()` and `>()`), subshells with mixed safe/unsafe, wrapper command unwrapping (including `--` and `nohup`), absolute paths, pure assignments (including with command substitution in values), sed -i variants, find -exec/-delete, xargs with inner command extraction, awk_safe_mode on/off, variable expansion in command position, empty/whitespace commands, comments, multiline commands, backgrounded commands, negation, and nested special-cases (find-in-xargs, git-in-find-exec).
+### What is configurable vs hard-coded
 
-## Edge cases to keep in mind
+| Aspect | User configurable? | Where |
+|---|---|---|
+| Whitelist additions/removals | Yes | `EXTRA_COMMANDS`, `REMOVE_COMMANDS` |
+| Feature flags | Yes | `GIT_LOCAL_WRITES`, `AWK_SAFE_MODE` |
+| Default whitelist | No | `DEFAULT_COMMANDS` in hook code |
+| Never-approve list | No | `NEVER_APPROVE` in hook code |
+| Wrapper commands | No | `WRAPPER_COMMANDS` in hook code |
+| Git subcommand classification | No | `GIT_READONLY`, `GIT_LOCAL_WRITES` in hook code |
+| Dangerous-mode handlers | No | `DANGEROUS_MODE_HANDLERS` in hook code |
+| Output format (PreToolUse/PermissionRequest) | Auto-detected | from `hook_event_name` in stdin |
 
-### Assignments and wrappers
-- `FOO=bar` with no command → pure assignment, harmless, approve. But `FOO=$(rm -rf /)` must still check the command substitution inside the value — the `rm` causes fall-through.
-- `env` with only VAR=val and no trailing command → harmless, approve.
-- `command -v git` → lookup, not execution, approve.
-- `command -p ls` → `-p` stripped, `ls` is whitelisted, approve.
-- `env -- rm -rf /` → `--` terminates env flags, `rm` extracted, falls through.
-- `nohup ls` → `nohup` unwrapped, `ls` whitelisted, approve.
-- `env nice bash -c 'anything'` → wrappers unwrapped, `bash` found underneath, falls through.
+## Commands intentionally excluded from the whitelist
+
+These fall through at step 7 (not on whitelist, not on never-approve):
+- `tee` — always writes to files
+- `curl`, `wget` — network access
+- `cp`, `mv`, `rm`, `mkdir`, `touch`, `chmod`, `chown` — obvious writes
+- `make`, `pip`, `npm`, `cargo`, `docker` — side-effecting build/install tools
+- `dd` — writes via `of=` without shell redirections
+- `ln` — creates links
+- `install`, `patch` — modifies files
+- `truncate`, `shred` — destructive
+- `xdg-open`, `open` — launches external programs
+- `date` — read-only without `-s`, but `date -s` sets the clock; excluded for simplicity
+- `tar` — list mode is read-only, but extract/create write; excluded for simplicity
+
+## Feature flags
+
+All default to `False`. Opt into categories of safe, local, reversible writes.
+
+### `GIT_LOCAL_WRITES`
+
+When enabled, additionally approves: `branch`, `tag`, `remote`, `stash`, `add`, and `config` (with guard: reject `--global`/`--system`). These are local-only, trivially reversible writes. `push`, `pull`, `commit`, `merge`, `rebase`, etc. always fall through.
+
+### `AWK_SAFE_MODE`
+
+When enabled, removes `awk`/`gawk`/`mawk`/`nawk` from the never-approve list and runs them through `handle_awk` instead (step 4). Safe awk programs (no `system()`, no pipes, no redirects) are approved. Dangerous or unanalyzable programs fall through.
+
+### Future flags (not yet implemented)
+
+- `ALLOW_OUTPUT_REDIRECTIONS` — allow `>` and `>>` to files
+- `NETWORK_READS` — allow read-only network commands (`curl -s` GET, `wget -O -`, `ping`, `dig`)
+- `SAFE_FILE_WRITES` — allow `mkdir -p`, `touch` (create empty files only)
+
+## Performance
+
+Each invocation spawns a new Python process:
+- Python cold-start: ~30-80ms
+- bashlex import: ~20-50ms
+- Config loading: Python import, cached by interpreter for the invocation
+- Total: ~50-150ms per call, acceptable for interactive use
+
+Optimizations if needed:
+- `#!/usr/bin/env python3 -S` to skip site-packages scan
+- Pre-compile to `.pyc`
+- Persistent daemon (socket-based) for sub-10ms — likely over-engineering for v1
+
+---
+
+# Part 3 — Test Reference
+
+## Test categories (~150 cases)
+
+### Simple commands
+- `ls -la` → approve
+- `cat file.txt` → approve
+- `rm file.txt` → fall through (not on whitelist)
+- `python3 script.py` → fall through (never-approve)
+
+### Pipelines
+- `ls | grep foo | sort | head -5` → approve (all whitelisted)
+- `ls | rm` → fall through (`rm` not whitelisted)
+- `ls -la | sort > sorted.txt` → fall through (`>` on last stage)
+
+### Compound commands
+- `ls && cat file` → approve
+- `grep foo bar || echo "not found"` → approve
+- `ls & rm foo` → fall through (`rm`)
+
+### Control flow
+- `for f in *.txt; do cat "$f"; done` → approve
+- `for f in *.txt; do rm "$f"; done` → fall through
+- `while read line; do echo "$line"; done` → approve
+- `if true; then rm foo; fi` → fall through
+- `ls() { rm -rf /; }; ls` → fall through (function body has `rm`)
+- `f() { grep foo bar; }; f` → fall through (`f` invocation not in whitelist)
 
 ### Redirections
-- `ls -la | sort > sorted.txt` → the `>` on the last pipeline stage causes fall-through.
-- `grep foo 2>&1` → fd duplication, NOT a file write, approve.
-- `ls >&output.txt` → file redirection via `>&`, falls through.
-
-### Path resolution
-- `/usr/bin/rm file.txt` → basename resolves to `rm`, falls through.
-- `./script.sh` → basename resolves to `script.sh`, not in whitelist, falls through.
-- `~/bin/my-tool` → not in whitelist, falls through.
-
-### sed
-- `sed -Ei 's/foo/bar/' file.txt` → combined flag `-Ei` contains `i`, falls through.
-- `sed --in-place=.bak 's/foo/bar/' file.txt` → `--in-place=` prefix detected, falls through.
-- `sed 's/foo/bar/' file.txt` → no `-i`, reaches whitelist, approve.
-
-### find
-- `find . -name "*.py"` → no exec/delete actions, approve.
-- `find . -name "*.pyc" -delete` → `-delete` detected, falls through.
-- `find . -exec rm {} \;` → inner command `rm` not in whitelist, falls through.
-- `find . -exec grep foo {} \;` → inner command `grep` is whitelisted, approve.
-- `find . -name "*.py" -exec grep foo {} \; -exec wc -l {} \;` → both inner commands whitelisted, approve.
-- `find . -name "*.py" -exec grep foo {} \; -exec rm {} \;` → second inner command `rm` fails, falls through.
-- `find . -execdir chmod 755 {} \;` → inner command `chmod` not in whitelist, falls through.
-- `find . -fprint /tmp/out.txt` → `-fprint` detected, falls through.
-- `find . -exec {} \;` → after stripping `{}`, no command remains, falls through.
-- `find . -exec sed -i 's/x/y/' {} \;` → inner command `sed` with `-i` rejected by step 4, falls through.
-
-### xargs
-- `ls | xargs grep foo` → inner command `grep` is whitelisted, approve.
-- `ls | xargs rm` → inner command `rm` not in whitelist, falls through.
-- `ls | xargs -I{} grep foo {}` → flags stripped, inner command `grep` whitelisted, approve.
-- `ls | xargs -0 -P4 wc -l` → flags stripped, inner command `wc` whitelisted, approve.
-- `ls | xargs --max-args=10 wc -l` → `--max-args=10` treated as single flag token, `wc` extracted, approve.
-- `ls | xargs` → no inner command, defaults to `echo`, approve.
-- `ls | xargs -I{} sh -c 'echo {}'` → inner command `sh` on never-approve list, falls through.
-- `cat files.txt | parallel rm` → `parallel` on never-approve list, falls through.
-
-### Nested special-cases (recursive evaluation)
-- `find . -exec xargs grep foo {} \;` → inner command `xargs` with inner command `grep`, both evaluated recursively, approve.
-- `xargs find . -name "*.py"` → inner command `find` with no exec/delete, approve.
-- `find . -exec git log {} \;` → inner command `git` with read-only subcommand, approve.
-- `xargs git push` → inner command `git` with `push` (always falls through), falls through.
-
-### awk (feature-flag dependent)
-- `awk '{print $1}' file.txt` → falls through by default; approved if `awk_safe_mode` enabled (no dangerous constructs).
-- `awk '{system("rm -rf /")}' file` → falls through by default; also falls through with `awk_safe_mode` (`system(` detected).
-- `awk '{print > "out.txt"}' file` → falls through by default; also falls through with `awk_safe_mode` (`>` detected).
-- `awk -f script.awk file` → always falls through (even with `awk_safe_mode`, `-f` makes static analysis impossible).
-
-### git
-- `git log --oneline` → always read-only, approve.
-- `git diff HEAD~3` → always read-only, approve.
-- `git -C /tmp/repo log` → global flag `-C` with arg skipped, subcommand `log` extracted, approve.
-- `git --no-pager diff` → global flag `--no-pager` skipped, subcommand `diff` extracted, approve.
-- `git -c core.pager=less log` → global flag `-c` with arg skipped, subcommand `log` extracted, approve.
-- `git` (no subcommand) → falls through.
-- `git unknown-subcommand` → not in any list, falls through.
-- `git branch feature-x` → falls through by default; approved if `git_local_writes` enabled.
-- `git config user.name "foo"` → falls through by default; approved if `git_local_writes` enabled.
-- `git config --global user.name "foo"` → always falls through (even with `git_local_writes`, `--global` is rejected).
-- `git config --system core.editor vim` → always falls through (even with `git_local_writes`, `--system` is rejected).
-- `git tag v1.0` → falls through by default; approved if `git_local_writes` enabled.
-- `git remote -v` → falls through by default; approved if `git_local_writes` enabled.
-- `git remote add origin url` → falls through by default; approved if `git_local_writes` enabled.
-- `git stash` → falls through by default; approved if `git_local_writes` enabled.
-- `git add .` → falls through by default; approved if `git_local_writes` enabled.
-- `git push origin main` → always falls through regardless of feature flags.
-- `git commit -m "msg"` → always falls through regardless of feature flags.
-
-### Control flow and functions
-- `for f in *.txt; do cat "$f"; done` → walker recurses into `ForNode`, `cat` whitelisted, approve.
-- `for f in *.txt; do rm "$f"; done` → walker recurses into `ForNode`, `rm` not whitelisted, falls through.
-- `while read line; do echo "$line"; done` → walker recurses into `WhileNode`, `read` and `echo` whitelisted, approve.
-- `if true; then rm foo; fi` → walker recurses into `IfNode`, `rm` causes fall-through.
-- `ls() { rm -rf /; }; ls` → walker recurses into `FunctionNode` body, `rm` causes fall-through. (Without function body inspection, `ls` invocation would falsely match whitelist.)
-- `f() { grep foo bar; }; f` → function body contains whitelisted `grep`, but `f` invocation is not in whitelist — falls through. (Function definitions with safe bodies do NOT add the function name to the whitelist.)
+- `grep foo 2>&1` → approve (fd duplication, not file write)
+- `ls > file.txt` → fall through
+- `cat < input.txt` → approve (input redirect)
+- `ls >&output.txt` → fall through (file redirect via `>&`)
 
 ### Substitutions
-- `echo $(rm -rf /)` → the `rm` fragment extracted from the substitution causes fall-through.
-- `echo $(echo $(rm -rf /))` → nested substitution, `rm` extracted at inner level, falls through.
-- `diff <(sort file1) <(sort file2)` → input process substitutions, inner `sort` whitelisted, approve.
-- `cat foo >(rm bar)` → output process substitution, inner `rm` not whitelisted, falls through.
-- `ls > >(tee /tmp/log)` → `>(...)` is output channel, falls through.
+- `echo $(ls)` → approve
+- `echo $(rm -rf /)` → fall through
+- `echo $(echo $(rm -rf /))` → fall through (nested)
+- `diff <(sort file1) <(sort file2)` → approve (input process sub)
+- `cat foo >(rm bar)` → fall through (output process sub)
+- `ls > >(tee /tmp/log)` → fall through (output channel)
 
-### Subshells and compound commands
-- `(ls; rm foo) | grep bar` → the `rm` inside the subshell causes fall-through.
-- `{ ls && cat file; }` → brace group, both whitelisted, approve.
-- `ls &` → backgrounded, `ls` whitelisted, approve.
-- `ls & rm foo` → `rm` not whitelisted, falls through.
-- `! grep foo bar` → negation, `grep` whitelisted, approve.
+### Wrapper unwrapping
+- `env ls` → approve
+- `nice -n 10 cat file` → approve
+- `nohup ls` → approve
+- `command -v git` → approve (lookup)
+- `command -p ls` → approve (`-p` stripped)
+- `env -- rm -rf /` → fall through (`rm` extracted)
+- `env nice bash -c 'anything'` → fall through (`bash` underneath)
+
+### Path resolution
+- `/usr/bin/ls` → approve
+- `/usr/bin/rm file.txt` → fall through
+- `./script.sh` → fall through (not in whitelist)
+
+### sed
+- `sed 's/foo/bar/' file.txt` → approve (no `-i`)
+- `sed -i 's/foo/bar/' file.txt` → fall through
+- `sed -Ei 's/foo/bar/' file.txt` → fall through (combined flag with `i`)
+- `sed --in-place=.bak 's/foo/bar/' file.txt` → fall through
+
+### find
+- `find . -name "*.py"` → approve
+- `find . -name "*.pyc" -delete` → fall through
+- `find . -exec rm {} \;` → fall through (`rm` fails pipeline)
+- `find . -exec grep foo {} \;` → approve (`grep` passes pipeline)
+- `find . -name "*.py" -exec grep foo {} \; -exec wc -l {} \;` → approve (both pass)
+- `find . -name "*.py" -exec grep foo {} \; -exec rm {} \;` → fall through (second fails)
+- `find . -fprint /tmp/out.txt` → fall through
+- `find . -exec {} \;` → fall through (no command after stripping `{}`)
+- `find . -exec sed -i 's/x/y/' {} \;` → fall through (`sed -i` rejected by handler)
+
+### xargs
+- `ls | xargs grep foo` → approve
+- `ls | xargs rm` → fall through
+- `ls | xargs -I{} grep foo {}` → approve (flags stripped)
+- `ls | xargs -0 -P4 wc -l` → approve
+- `ls | xargs --max-args=10 wc -l` → approve (`=` syntax)
+- `ls | xargs` → approve (defaults to `echo`)
+- `ls | xargs -I{} sh -c 'echo {}'` → fall through (`sh` on never-approve)
+
+### Nested special-cases (recursive evaluation)
+- `find . -exec xargs grep foo {} \;` → approve
+- `xargs find . -name "*.py"` → approve
+- `find . -exec git log {} \;` → approve
+- `xargs git push` → fall through
+
+### awk (feature-flag dependent)
+- `awk '{print $1}' file.txt` → fall through by default; approve if `AWK_SAFE_MODE`
+- `awk '{system("rm -rf /")}' file` → fall through (always)
+- `awk '{print > "out.txt"}' file` → fall through (always)
+- `awk -f script.awk file` → fall through (always; `-f` prevents analysis)
+
+### git
+- `git log --oneline` → approve
+- `git diff HEAD~3` → approve
+- `git -C /tmp/repo log` → approve (global flag skipped)
+- `git --no-pager diff` → approve
+- `git -c core.pager=less log` → approve (global flag with arg skipped)
+- `git` (no subcommand) → fall through
+- `git unknown-subcommand` → fall through
+- `git branch feature-x` → fall through by default; approve if `GIT_LOCAL_WRITES`
+- `git config user.name "foo"` → fall through by default; approve if `GIT_LOCAL_WRITES`
+- `git config --global user.name "foo"` → fall through (always; `--global` guard)
+- `git config --system core.editor vim` → fall through (always; `--system` guard)
+- `git push origin main` → fall through (always)
+- `git commit -m "msg"` → fall through (always)
+
+### Assignments
+- `FOO=bar` (no command) → approve (pure assignment)
+- `FOO=$(rm -rf /)` → fall through (substitution has `rm`)
+- `env` with only VAR=val → approve
 
 ### Variable expansion and unknowable commands
-- `$CMD foo` → command name is a variable, cannot determine at static analysis time, falls through.
-- `${MY_TOOL} --version` → same, falls through.
-- `"$(which grep)" foo bar` → outer command is a substitution result, falls through.
+- `$CMD foo` → fall through (command is a variable)
+- `${MY_TOOL} --version` → fall through
+- `"$(which grep)" foo bar` → fall through
 
 ### Empty/whitespace/comments
-- `""` (empty command) → no fragments, approve (no-op).
-- `"   "` (whitespace only) → no fragments, approve (no-op).
-- `ls # rm -rf /` → comment after `#` ignored by parser, `ls` whitelisted, approve.
-- `# just a comment` → no command, approve.
+- `""` → approve (no-op)
+- `"   "` → approve (no-op)
+- `ls # rm -rf /` → approve (comment ignored, `ls` whitelisted)
+- `# just a comment` → approve
 
 ### Multiline and heredocs
-- `ls -la &&\ngrep foo bar &&\nwc -l` → multiline with `&&`, all whitelisted, approve.
-- `cat <<'EOF'\nhello\nEOF` → heredoc input to `cat`, approve (if bashlex parses it; fall through on parse error).
-- `python3 <<'EOF'\nprint("hi")\nEOF` → `python3` on never-approve list, falls through.
+- `ls -la &&\ngrep foo bar &&\nwc -l` → approve
+- `cat <<'EOF'\nhello\nEOF` → approve (if bashlex parses it)
+- `python3 <<'EOF'\nprint("hi")\nEOF` → fall through (`python3` on never-approve)
+
+### Subshells and compound
+- `(ls; rm foo) | grep bar` → fall through (`rm` in subshell)
+- `{ ls && cat file; }` → approve
+- `ls &` → approve (backgrounded)
+- `! grep foo bar` → approve (negation)
 
 ### Aliases and builtins
-- The hook evaluates the literal command string, not alias-expanded forms. This is safe because Claude Code runs commands via `bash -c` which does not load interactive aliases from `.bashrc`.
-- `test -f file.txt` → `test` whitelisted, approve.
-- `[ -f file.txt ]` → `[` whitelisted, approve.
+- Claude Code runs via `bash -c` — no interactive aliases loaded. Safe.
+- `test -f file.txt` → approve
+- `[ -f file.txt ]` → approve
+
+### Parallel (always never-approve)
+- `cat files.txt | parallel rm` → fall through
