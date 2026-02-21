@@ -52,10 +52,23 @@ The hook reads JSON from stdin (Claude Code hook protocol), extracts `tool_name`
    - `command`: if followed by `-v`/`-V`, approve immediately (it's a lookup). Otherwise unwrap.
    - After stripping, the next token is the real executable.
 4. **Special-case `sed`** — reject if any arg is `-i`, starts with `-i`, is `--in-place`, or is a combined short flag containing `i` (like `-ni`, `-Ei`). sed without `-i` is read-only (prints to stdout).
-5. **Never-approve list** — hard-reject interpreters and escape hatches: `eval`, `exec`, `source`, `.`, `sudo`, `su`, `bash`, `sh`, `zsh`, `fish`, `dash`, `csh`, `ksh`, `python`, `python3`, `perl`, `ruby`, `node`, `deno`, `bun`.
-6. **Special-case `git`** — only approve if subcommand is in an explicit read-only list: `blame`, `branch`, `config`, `diff`, `log`, `ls-files`, `ls-tree`, `remote`, `rev-parse`, `show`, `show-ref`, `status`, `tag`. All others (push, commit, checkout, merge, rebase, reset, stash, add, rm, clean, etc.) fall through.
-7. **General whitelist check** — approve if executable basename is in `allowed_commands`.
-8. **Default** — not in whitelist → fall through.
+5. **Special-case `find`** — scan the argument list for:
+   - **Destructive actions** (`-delete`, `-fprint`, `-fprint0`, `-fprintf`): reject on sight, no inner command to inspect.
+   - **Exec actions** (`-exec`, `-execdir`, `-ok`, `-okdir`): extract the tokens between the action flag and its terminator (`;` or `+`). Strip placeholder tokens (`{}`) — these are path arguments, not commands. Feed the remaining tokens (command name + its args) through the same fragment evaluation logic used everywhere else. The inner command must pass the whitelist, never-approve list, and all other checks.
+   - Multiple exec blocks can be chained in a single `find` invocation (`find . -name "*.py" -exec grep foo {} \; -exec wc -l {} \;`). Each one is extracted and evaluated independently. ALL must pass.
+   - `find` with none of these flags (just predicates like `-name`, `-type`, `-mtime`, etc.) is purely read-only and approved as-is.
+6. **Special-case `xargs`** — strip known flags to find the inner command:
+   - **Flags with args** (consume next token): `-d`, `-a`, `-I`, `-L`, `-n`, `-P`, `-s`, `-E`, `--max-args`, `--max-procs`, `--max-chars`, `--delimiter`, `--arg-file`, `--replace`, `--max-lines`, `--eof`.
+   - **Flags without args** (skip): `-0`, `-r`, `-t`, `-p`, `-x`, `--null`, `--no-run-if-empty`, `--verbose`, `--interactive`, `--exit`, `--open-tty`.
+   - After stripping flags, the remaining tokens are the inner command + its args. Feed through the same fragment evaluation logic. The inner command must pass all checks.
+   - If no inner command remains after flag stripping, `xargs` defaults to `echo` — approve.
+7. **Never-approve list** — hard-reject interpreters and escape hatches: `eval`, `exec`, `source`, `.`, `sudo`, `su`, `bash`, `sh`, `zsh`, `fish`, `dash`, `csh`, `ksh`, `python`, `python3`, `perl`, `ruby`, `node`, `deno`, `bun`, `parallel`.
+8. **Special-case `git`** — extract the subcommand (first non-flag arg). Evaluation depends on the `git_local_writes` feature flag:
+   - **Always approved** (strictly read-only): `blame`, `diff`, `log`, `ls-files`, `ls-tree`, `rev-parse`, `show`, `show-ref`, `status`.
+   - **Approved only if `git_local_writes` is enabled**: `branch`, `tag`, `remote`, `stash`, `add`, and `config` (with arg-level guard: reject if `--global` or `--system` present).
+   - **Always fall through**: `push`, `pull`, `fetch`, `commit`, `merge`, `rebase`, `reset`, `checkout`, `switch`, `restore`, `rm`, `clean`, `cherry-pick`, `revert`, `am`, `apply`, and anything not explicitly listed.
+9. **General whitelist check** — approve if executable basename is in `allowed_commands`.
+10. **Default** — not in whitelist → fall through.
 
 ## Recursive walking details
 
@@ -70,9 +83,40 @@ Command substitution (`$(rm -rf /)` inside `echo $(rm -rf /)`) and process subst
 Store separately from the hook script for easy editing. Contains:
 
 - `allowed_commands`: flat list of command basenames (ls, cat, grep, find, sort, wc, head, tail, awk, jq, rg, fd, tree, stat, du, df, ps, etc.)
-- `git_readonly_subcommands`: list of safe git subcommands
+- `git_readonly_subcommands`: list of strictly read-only git subcommands (see git section)
 - `wrapper_commands`: list of prefix commands to unwrap (env, nice, time, command)
 - `allow_output_redirections`: boolean (should be false)
+- `feature_flags`: object with boolean flags for opt-in safe-write categories (all default to false)
+
+## Feature flags
+
+The hook is strictly read-only by default. Feature flags opt into categories of low-risk, local, easily-reversible write operations. Each flag is a boolean in `config.feature_flags`, defaulting to `false` when absent.
+
+### `git_local_writes`
+
+When **disabled** (default): git evaluation only approves subcommands from `git_readonly_subcommands` — a strictly read-only list: `blame`, `diff`, `log`, `ls-files`, `ls-tree`, `rev-parse`, `show`, `show-ref`, `status`.
+
+When **enabled**: additionally approves these subcommands, which perform local-only writes that are trivially reversible:
+- `branch` — creates/deletes local branches. Never touches the remote.
+- `config` — writes local git config. Excludes `--global` and `--system` (those fall through).
+- `tag` — creates/deletes local tags. Never touches the remote.
+- `remote` — adds/removes remote definitions (local config only, no network).
+- `stash` — saves/restores working directory state. Always reversible.
+- `add` — stages files. Reversible with `git restore --staged`.
+
+Even with this flag enabled, the following always fall through: `push`, `pull`, `fetch`, `commit`, `merge`, `rebase`, `reset`, `checkout`, `switch`, `restore`, `rm`, `clean`, `cherry-pick`, `revert`, `am`, `apply`.
+
+### `git_local_writes` arg-level guards
+
+Some subcommands enabled by `git_local_writes` need arg-level checks to prevent non-local effects:
+- `git config`: reject if args contain `--global` or `--system` (these write outside the repo). `--local` and no scope flag are fine.
+
+### Future feature flags (not yet implemented)
+
+Placeholders for future safe-write categories, to be designed as needed:
+- `allow_output_redirections` — allow `>` and `>>` to files (currently always rejected).
+- `network_reads` — allow read-only network commands like `curl -s` (GET only), `wget -O -`, `ping`, `dig`, `nslookup`, `host`.
+- `safe_file_writes` — allow low-risk file operations like `mkdir -p`, `touch` (create empty files only).
 
 ### Commands intentionally excluded from the whitelist
 
@@ -82,6 +126,8 @@ Store separately from the hook script for easy editing. Contains:
 - `curl`, `wget` — network access, not read-only.
 - `cp`, `mv`, `rm`, `mkdir`, `touch`, `chmod`, `chown` — obvious writes.
 - `make`, `pip`, `npm`, `cargo`, `docker` — side-effecting build/install tools.
+- `parallel` — GNU parallel accepts shell snippet strings as commands, too flexible to parse reliably. On the never-approve list.
+- `xargs` is included but special-cased: inner command is extracted and evaluated. `xargs` with no inner command (defaults to `echo`) is approved.
 
 ## Hook protocol summary
 
@@ -132,3 +178,27 @@ Set `READONLY_HOOK_DEBUG=1` env var. Logs to `~/.claude/hooks/readonly_bash.log`
 - `/usr/bin/rm file.txt` → basename resolves to `rm`, falls through.
 - `env nice bash -c 'anything'` → wrappers unwrapped, `bash` found underneath, falls through.
 - `sed -Ei 's/foo/bar/' file.txt` → combined flag `-Ei` contains `i`, falls through.
+- `find . -name "*.py"` → no exec/delete actions, approve.
+- `find . -name "*.pyc" -delete` → `-delete` detected, falls through.
+- `find . -exec rm {} \;` → inner command `rm` not in whitelist, falls through.
+- `find . -exec grep foo {} \;` → inner command `grep` is whitelisted, approve.
+- `find . -name "*.py" -exec grep foo {} \; -exec wc -l {} \;` → both inner commands whitelisted, approve.
+- `find . -name "*.py" -exec grep foo {} \; -exec rm {} \;` → second inner command `rm` fails, falls through.
+- `find . -execdir chmod 755 {} \;` → inner command `chmod` not in whitelist, falls through.
+- `find . -fprint /tmp/out.txt` → `-fprint` detected, falls through.
+- `ls | xargs grep foo` → inner command `grep` is whitelisted, approve.
+- `ls | xargs rm` → inner command `rm` not in whitelist, falls through.
+- `ls | xargs -I{} grep foo {}` → flags stripped, inner command `grep` whitelisted, approve.
+- `ls | xargs -0 -P4 wc -l` → flags stripped, inner command `wc` whitelisted, approve.
+- `ls | xargs` → no inner command, defaults to `echo`, approve.
+- `cat files.txt | parallel rm` → `parallel` on never-approve list, falls through.
+- `git log --oneline` → always read-only, approve.
+- `git diff HEAD~3` → always read-only, approve.
+- `git branch feature-x` → falls through by default; approved if `git_local_writes` enabled.
+- `git config user.name "foo"` → falls through by default; approved if `git_local_writes` enabled.
+- `git config --global user.name "foo"` → always falls through (even with `git_local_writes`, `--global` is rejected).
+- `git tag v1.0` → falls through by default; approved if `git_local_writes` enabled.
+- `git stash` → falls through by default; approved if `git_local_writes` enabled.
+- `git add .` → falls through by default; approved if `git_local_writes` enabled.
+- `git push origin main` → always falls through regardless of feature flags.
+- `git commit -m "msg"` → always falls through regardless of feature flags.
