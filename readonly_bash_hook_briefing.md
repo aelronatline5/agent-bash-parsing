@@ -102,6 +102,91 @@ Set `READONLY_HOOK_DEBUG` env var. Logs to `~/.claude/hooks/readonly_bash.log`.
 
 # Part 2 — Implementation Spec
 
+## Public API surface
+
+The module `readonly_bash_hook` must export the following names. This table is the contract between the implementation and any consumer (tests, future tooling, hook entry point).
+
+### Constants
+
+| Name | Type | Description |
+|---|---|---|
+| `APPROVE` | sentinel | Fragment/command passed safety checks |
+| `FALLTHROUGH` | sentinel | Command should fall through to user prompt |
+| `REJECT` | sentinel | Fragment-level: this step rejects the fragment |
+| `NEXT` | sentinel | Fragment-level: this step has no opinion, pass to next |
+| `PASS` | sentinel | Handler-level: handler found no dangerous mode |
+| `DEFAULT_COMMANDS` | `set[str]` | Built-in whitelist (code constant) |
+| `NEVER_APPROVE` | `set[str]` | Unconditional reject list (code constant) |
+| `GIT_READONLY` | `set[str]` | Git subcommands that are always read-only |
+| `GIT_LOCAL_WRITES_CMDS` | `set[str]` | Git subcommands approved when `GIT_LOCAL_WRITES` flag is on |
+
+### Dataclass
+
+```python
+@dataclass
+class CommandFragment:
+    executable: str            # resolved basename (e.g., "ls", "git")
+    args: list[str]            # arguments after the executable
+    has_output_redirect: bool  # True if fragment has > or >> redirect
+```
+
+### Core functions
+
+| Function | Signature | Returns | Description |
+|---|---|---|---|
+| `parse_command` | `(cmd: str) -> list[CommandFragment]` | list of fragments | Pre-parse + bashlex + AST walk. Returns `[]` on empty/comment-only input. On parse failure → returns a sentinel that forces fall-through. |
+| `evaluate_fragments` | `(fragments: list[CommandFragment], config) -> APPROVE \| FALLTHROUGH` | decision | Runs every fragment through the 7-step pipeline. ALL must pass → `APPROVE`. ANY reject → `FALLTHROUGH`. Empty list → `APPROVE`. |
+| `evaluate_command` | `(cmd: str, config) -> APPROVE \| FALLTHROUGH` | decision | Convenience: `parse_command` + `evaluate_fragments`. This is the main entry point for programmatic use. |
+
+### Pipeline step functions
+
+Each step receives a `CommandFragment` and `config`, returns `APPROVE`, `REJECT`, or `NEXT`.
+
+| Function | Pipeline step | Description |
+|---|---|---|
+| `step1_redirections` | Step 1 — REJECT (structural) | Reject if `has_output_redirect` is True |
+| `step2_normalize` | Step 2 — NORMALIZE | Resolve basename, unwrap wrappers. Mutates/replaces the fragment. |
+| `step3_never_approve` | Step 3 — REJECT (unconditional) | Reject if executable is in `NEVER_APPROVE` |
+| `step5_git` | Step 5 — APPROVE (domain) | Git subcommand evaluation. Returns `APPROVE` or `NEXT`. |
+| `step6_whitelist` | Step 6 — APPROVE (general) | Whitelist check. Returns `APPROVE` or `NEXT`. |
+| `step7_default` | Step 7 — REJECT (default) | Always returns `REJECT`. |
+
+Note: Step 4 (dangerous-modes handlers) is dispatched inline — no single step function. The handlers are called between step 3 and step 5.
+
+### Handler functions
+
+Each handler receives args (`list[str]`) and `config`, returns `REJECT` or `PASS`.
+
+| Function | Handles | Description |
+|---|---|---|
+| `handle_sed` | `sed` | Reject if `-i` or `--in-place` detected |
+| `handle_find` | `find` | Reject if `-delete`/`-fprint`; recursively evaluate `-exec` inner commands |
+| `handle_xargs` | `xargs` | Strip flags, recursively evaluate inner command |
+| `handle_awk` | `awk`, `gawk`, `mawk`, `nawk` | Reject if `system()`, pipes, redirects, or `-f` in program |
+
+### Config functions
+
+| Function | Signature | Returns | Description |
+|---|---|---|---|
+| `build_config` | `(extra_commands: list[str], remove_commands: list[str], git_local_writes: bool, awk_safe_mode: bool)` | config object | Build a config from explicit parameters. Used for programmatic/test use. |
+| `get_effective_whitelist` | `(config) -> set[str]` | effective whitelist | `DEFAULT_COMMANDS + extras - removals` |
+
+### Pre-parse functions
+
+| Function | Signature | Returns | Description |
+|---|---|---|---|
+| `preparse_strip_time` | `(cmd: str) -> str` | cleaned string | Strip `time` keyword and its flags from the front |
+| `preparse_command` | `(cmd: str) -> str` | cleaned string | All pre-parse workarounds combined (time, `$((...))`, `[[ ]]`) |
+
+### Output and event functions
+
+| Function | Signature | Returns | Description |
+|---|---|---|---|
+| `format_pretooluse_approval` | `(cmd: str) -> str` | JSON string | PreToolUse approval output with reason |
+| `format_permission_request_approval` | `(cmd: str) -> str` | JSON string | PermissionRequest approval output |
+| `detect_event_type` | `(stdin_json: str) -> str` | event name | Extract `hook_event_name` from stdin JSON |
+| `process_hook_input` | `(stdin_json: str) -> str \| None` | JSON or None | Full pipeline: parse stdin → evaluate → format output. Returns `None` or `""` for fall-through. |
+
 ## Architecture overview
 
 ```
@@ -353,7 +438,7 @@ GIT_READONLY = {
     "rev-parse", "show", "show-ref", "status",
 }
 
-GIT_LOCAL_WRITES = {
+GIT_LOCAL_WRITES_CMDS = {
     "branch", "tag", "remote", "stash", "add",
     "config",  # with arg-level guard: reject --global and --system
 }
@@ -364,7 +449,7 @@ GIT_LOCAL_WRITES = {
 ```
 
 - Subcommand in `GIT_READONLY` → APPROVE.
-- Subcommand in `GIT_LOCAL_WRITES` and `GIT_LOCAL_WRITES` flag enabled → APPROVE (with arg guard for `config`).
+- Subcommand in `GIT_LOCAL_WRITES_CMDS` and `GIT_LOCAL_WRITES` flag enabled → APPROVE (with arg guard for `config`).
 - Otherwise → fall through.
 
 `git` must NOT appear on the general whitelist — its approval is handled entirely here.
@@ -443,7 +528,7 @@ awk_safe_mode = get_config("AWK_SAFE_MODE", False)
 | Default whitelist | No | `DEFAULT_COMMANDS` in hook code |
 | Never-approve list | No | `NEVER_APPROVE` in hook code |
 | Wrapper commands | No | `WRAPPER_COMMANDS` in hook code |
-| Git subcommand classification | No | `GIT_READONLY`, `GIT_LOCAL_WRITES` in hook code |
+| Git subcommand classification | No | `GIT_READONLY`, `GIT_LOCAL_WRITES_CMDS` in hook code |
 | Dangerous-mode handlers | No | `DANGEROUS_MODE_HANDLERS` in hook code |
 | Output format (PreToolUse/PermissionRequest) | Auto-detected | from `hook_event_name` in stdin |
 
