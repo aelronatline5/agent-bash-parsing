@@ -113,6 +113,33 @@ stdin (JSON) → detect event type → bail if not Bash
   → ANY fail? → exit 0, no output (fall through)
 ```
 
+### Two-stage design: parsing and evaluation are separate
+
+The hook has two distinct stages with a clean boundary between them:
+
+1. **Parsing stage** — reads the command string, invokes bashlex, walks the AST, and produces a flat list of `CommandFragment` objects. This stage knows about shell syntax (pipes, subshells, substitutions, control flow) but knows nothing about which commands are safe or dangerous.
+
+2. **Evaluation stage** — receives `CommandFragment` objects and runs each through the 7-step pipeline. This stage knows about command safety (whitelists, never-approve lists, dangerous modes, git subcommands) but knows nothing about shell syntax.
+
+The `CommandFragment` is the interface between them:
+
+```python
+@dataclass
+class CommandFragment:
+    executable: str          # resolved basename (e.g., "ls", "git")
+    args: list[str]          # arguments after the executable
+    has_output_redirect: bool  # True if fragment has > or >> redirect
+    # Future: source_node, position info for debug logging
+```
+
+**This separation is a deliberate architectural constraint.** It means:
+
+- **New evaluation logic** (feature flags, new safety categories, domain-specific rules) is added by extending the pipeline — new steps, new handlers, new feature flags. The parser is never touched.
+- **New shell syntax support** (if bashlex improves, or for pre-parse workarounds) is handled in the parser. Evaluation logic is never touched.
+- **The pipeline is an ordered, extensible sequence.** Steps can be added, reordered, or replaced independently. Each step receives a `CommandFragment` and returns one of: `APPROVE`, `REJECT` (fall through), or `NEXT` (no opinion, pass to next step).
+
+The existing feature flags already follow this pattern: `GIT_LOCAL_WRITES` toggles behavior in step 5, `AWK_SAFE_MODE` toggles handler registration in step 4 — neither affects parsing. Future flags (`SAFE_FILE_WRITES`, `NETWORK_READS`, `ALLOW_OUTPUT_REDIRECTIONS`) will do the same: register new handlers or modify step behavior, with the parser unchanged.
+
 ## Hook event modes: PreToolUse vs PermissionRequest
 
 The permission evaluation order is: **PreToolUse → Deny rules → Allow rules → Ask rules → PermissionRequest → canUseTool**.
