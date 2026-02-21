@@ -1,0 +1,28 @@
+[project]
+name = "readonly-bash-hook"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["bashlex"]
+
+[dependency-groups]
+dev = ["pytest>=8.0", "pytest-cov", "coverage[toml]"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short --strict-markers"
+markers = [
+    "approve: commands expected to be approved",
+    "fallthrough: commands expected to fall through",
+    "feature_git_local_writes: requires GIT_LOCAL_WRITES=True",
+    "feature_awk_safe_mode: requires AWK_SAFE_MODE=True",
+    "slow: marks tests as slow (e.g., subprocess E2E)",
+]
+
+[tool.coverage.run]
+source = ["readonly_bash_hook"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 95
+show_missing = true
+exclude_lines = ["if __name__", "pragma: no cover"]
