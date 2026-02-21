@@ -15,10 +15,9 @@ A Claude Code hook (Python) that auto-approves Bash commands when they are stric
 ```bash
 pip install bashlex
 cp readonly_bash_hook.py ~/.claude/hooks/
-cp readonly_bash_config.py ~/.claude/hooks/   # optional — only if customizing
 ```
 
-Wire in `.claude/settings.json` or `~/.claude/settings.json`:
+Wire in `.claude/settings.json` or `~/.claude/settings.json` (add the `readonlyBashHook` key only if customizing — see Configuration below):
 
 ```json
 {
@@ -67,28 +66,49 @@ Alternatively, wire to `PreToolUse` instead (see Part 2 for the difference).
 
 ## Configuration (optional)
 
-Configuration is a Python module. Create `readonly_bash_config.py` next to the hook script, or skip it entirely for defaults.
+Configuration lives inside Claude Code's `settings.json` (either `~/.claude/settings.json` or `.claude/settings.json`), under the hook's own key. No separate config file needed — Claude Code can edit this naturally via user prompting.
 
-```python
-# readonly_bash_config.py — only set what you want to change
+If the key is absent, all defaults apply. Only set what you want to change:
 
-# Add commands to the built-in whitelist
-EXTRA_COMMANDS = ["kubectl", "helm", "terraform", "gcloud"]
-
-# Remove commands from the built-in whitelist (if you disagree with a default)
-REMOVE_COMMANDS = []
-
-# Feature flags — opt into categories of safe writes
-GIT_LOCAL_WRITES = False   # allow git branch, tag, stash, add, config (local only)
-AWK_SAFE_MODE = False      # allow awk when program has no system()/pipes/redirects
+```json
+{
+  "hooks": {
+    "PermissionRequest": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/hooks/readonly_bash_hook.py"
+          }
+        ]
+      }
+    ]
+  },
+  "readonlyBashHook": {
+    "extraCommands": ["kubectl", "helm", "terraform", "gcloud"],
+    "removeCommands": [],
+    "features": {
+      "gitLocalWrites": false,
+      "awkSafeMode": false
+    }
+  }
+}
 ```
 
-That's it. Three knobs:
-1. **EXTRA_COMMANDS** — add domain-specific read-only tools to the whitelist
-2. **REMOVE_COMMANDS** — remove commands you consider unsafe
-3. **Feature flags** — opt into safe-write categories
+Three knobs:
+1. **extraCommands** — add domain-specific read-only tools to the whitelist
+2. **removeCommands** — remove commands you consider unsafe
+3. **features** — opt into safe-write categories (each activates handler logic baked into the hook code)
 
 Everything else (never-approve list, wrapper commands, git subcommand classification, handler dispatch) is baked into the hook code. These are security invariants, not user preferences.
+
+### How the hook reads config
+
+The hook reads `settings.json` at startup, looks for the `readonlyBashHook` key, and falls back to defaults for any missing field. Internally, it calls `build_config()` with the resolved values — the same function used for programmatic/test configuration. Two entry points, one config object:
+
+- **User-facing:** JSON in `settings.json` → hook reads at startup
+- **Programmatic/test:** `build_config(extra_commands=[], remove_commands=[], git_local_writes=False, awk_safe_mode=False)`
 
 ## Debug logging
 
@@ -497,34 +517,37 @@ DEFAULT_COMMANDS = {
 
 Not in whitelist → fall through to user prompt.
 
-## Config-as-code module
+## Config loading
 
-The hook imports `readonly_bash_config` (Python module next to the hook script). If the module doesn't exist → all defaults apply. If it exists but has missing attributes → defaults for those attributes.
+The hook reads config from two sources, with a single internal representation:
+
+### 1. JSON config (user-facing)
+
+At startup, the hook locates `settings.json` (searching `.claude/settings.json` then `~/.claude/settings.json`), reads the `readonlyBashHook` key, and falls back to defaults for any missing field.
 
 ```python
 # In the hook:
-try:
-    import readonly_bash_config as cfg
-except ImportError:
-    cfg = None
-
-def get_config(attr, default):
-    return getattr(cfg, attr, default) if cfg else default
-
-extra = set(get_config("EXTRA_COMMANDS", []))
-remove = set(get_config("REMOVE_COMMANDS", []))
-effective_whitelist = (DEFAULT_COMMANDS | extra) - remove
-
-git_local_writes = get_config("GIT_LOCAL_WRITES", False)
-awk_safe_mode = get_config("AWK_SAFE_MODE", False)
+def load_config_from_settings() -> Config:
+    settings = _find_and_read_settings_json()
+    hook_cfg = settings.get("readonlyBashHook", {})
+    return build_config(
+        extra_commands=hook_cfg.get("extraCommands", []),
+        remove_commands=hook_cfg.get("removeCommands", []),
+        git_local_writes=hook_cfg.get("features", {}).get("gitLocalWrites", False),
+        awk_safe_mode=hook_cfg.get("features", {}).get("awkSafeMode", False),
+    )
 ```
+
+### 2. Programmatic config (tests, embedding)
+
+`build_config()` takes explicit parameters — no file I/O, no JSON parsing. Tests and programmatic callers use this directly.
 
 ### What is configurable vs hard-coded
 
 | Aspect | User configurable? | Where |
 |---|---|---|
-| Whitelist additions/removals | Yes | `EXTRA_COMMANDS`, `REMOVE_COMMANDS` |
-| Feature flags | Yes | `GIT_LOCAL_WRITES`, `AWK_SAFE_MODE` |
+| Whitelist additions/removals | Yes | `readonlyBashHook.extraCommands`, `removeCommands` in settings.json |
+| Feature flags | Yes | `readonlyBashHook.features` in settings.json |
 | Default whitelist | No | `DEFAULT_COMMANDS` in hook code |
 | Never-approve list | No | `NEVER_APPROVE` in hook code |
 | Wrapper commands | No | `WRAPPER_COMMANDS` in hook code |
