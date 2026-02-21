@@ -1,12 +1,34 @@
-# Briefing: Read-Only Bash PermissionRequest Hook for Claude Code
+# Briefing: Read-Only Bash Hook for Claude Code
 
 ## Goal
 
-Build a Claude Code `PermissionRequest` hook (Python) that auto-approves Bash tool uses when the entire command is strictly read-only. Non-read-only commands fall through silently to the normal user prompt — never hard-denied.
+Build a Claude Code hook (Python) that auto-approves Bash tool uses when the entire command is strictly read-only. Non-read-only commands fall through silently to the normal user prompt — never hard-denied. The hook supports both `PreToolUse` and `PermissionRequest` events via a single script that auto-detects the event type from stdin.
 
-## Why PermissionRequest (not PreToolUse)
+## Hook event modes: PreToolUse vs PermissionRequest
 
-The permission evaluation order is: PreToolUse → Deny rules → Allow rules → Ask rules → PermissionRequest → canUseTool. PermissionRequest fires only when the declarative rules in settings.json didn't already resolve the decision. This means you can still use `permissions.deny` for hard blocks like `rm -rf *`, and this hook handles the nuanced compound-command analysis for everything that falls through. If we used PreToolUse instead, we'd be duplicating work the declarative rules already handle.
+The permission evaluation order is: **PreToolUse → Deny rules → Allow rules → Ask rules → PermissionRequest → canUseTool**.
+
+The hook can be wired to either event. The core analysis logic (parse, walk, evaluate) is identical — only the output format and behavioral semantics differ:
+
+| Aspect | PreToolUse | PermissionRequest |
+|---|---|---|
+| **When fires** | Before every Bash tool call, regardless of permissions | Only when a permission dialog would be shown |
+| **Approval output** | `hookSpecificOutput.permissionDecision: "allow"` | `hookSpecificOutput.decision.behavior: "allow"` |
+| **Decision values** | `"allow"` / `"deny"` / `"ask"` (3-way) | `"allow"` / `"deny"` (2-way) |
+| **Empty exit 0** | Falls through to permission system (deny/allow/ask rules still apply) | Shows the permission dialog to the user |
+| **Exit 2** | Blocks the tool call, stderr fed to Claude | Denies permission, stderr fed to Claude |
+| **Can modify input** | Yes, via `updatedInput` | Yes, via `decision.updatedInput` |
+| **Extra stdin fields** | `tool_use_id` | `permission_suggestions` |
+
+### Which to choose
+
+- **PermissionRequest** (recommended default): fires only when declarative rules didn't already resolve the decision. This means you can still use `permissions.deny` for hard blocks like `rm -rf *`, and `permissions.allow` for commands you always want approved. The hook handles only the nuanced compound-command analysis for everything that falls through. Less invocations, less overhead.
+
+- **PreToolUse**: fires on every Bash call. Useful if you want the hook to be the single source of truth for all Bash permissions, bypassing declarative rules entirely. The hook's `"allow"` decision skips all subsequent permission checks. More control, but more invocations and the hook must handle every Bash command (including those that declarative rules would have already handled).
+
+### Auto-detection
+
+The hook reads `hook_event_name` from the stdin JSON and formats its output accordingly. No config needed — wire it to whichever event you want (or both, though that's redundant).
 
 ## Parser: bashlex (not shlex)
 
@@ -55,14 +77,14 @@ The permission evaluation order is: PreToolUse → Deny rules → Allow rules �
 
 ## Architecture
 
-The hook reads JSON from stdin (Claude Code hook protocol), extracts `tool_name` and `tool_input.command`, then:
+The hook reads JSON from stdin (Claude Code hook protocol), extracts `hook_event_name`, `tool_name`, and `tool_input.command`, then:
 
 1. **Bail early** if `tool_name != "Bash"`.
 2. **Pre-strip `time`** keyword (bashlex can't parse it).
 3. **Parse** with `bashlex.parse()`. On parse error → fall through.
 4. **Recursively walk** the AST to extract a flat list of `CommandFragment` objects, each with: executable name, args list, and whether it has output redirections.
 5. **Evaluate every fragment** against the config. ALL must pass for approval.
-6. **Output** the PermissionRequest approval JSON on stdout + exit 0 if approved. Output nothing + exit 0 if any fragment fails (falls through to user prompt).
+6. **Output** the event-appropriate approval JSON on stdout + exit 0 if approved. The hook checks `hook_event_name` and formats the output as PreToolUse or PermissionRequest accordingly (see Hook protocol summary). Output nothing + exit 0 if any fragment fails (falls through).
 
 ## Fragment evaluation logic (in order)
 
@@ -250,28 +272,55 @@ Beyond the basics (`ls`, `cat`, `grep`, `find`, `sort`, `wc`, `head`, `tail`, `j
 
 ## Hook protocol summary
 
-- **Stdin**: JSON with `session_id`, `cwd`, `permission_mode`, `hook_event_name`, `tool_name`, `tool_input`, `transcript_path`.
-- **Stdout on exit 0**: parsed as JSON. The PermissionRequest event requires the `hookSpecificOutput` wrapper:
-  ```json
-  {
-    "hookSpecificOutput": {
-      "hookEventName": "PermissionRequest",
-      "decision": {
-        "behavior": "allow"
-      }
+### Stdin (both events)
+
+JSON with: `session_id`, `cwd`, `permission_mode`, `hook_event_name`, `tool_name`, `tool_input`, `transcript_path`. PreToolUse additionally receives `tool_use_id`. PermissionRequest additionally receives `permission_suggestions`.
+
+The hook reads `hook_event_name` to determine which output format to use.
+
+### Stdout on exit 0 — approval output
+
+**PreToolUse approval:**
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "allow",
+    "permissionDecisionReason": "Read-only command: ls -la"
+  }
+}
+```
+
+**PermissionRequest approval:**
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PermissionRequest",
+    "decision": {
+      "behavior": "allow"
     }
   }
-  ```
-  If stdout is empty or has no `hookSpecificOutput` → fall through to user prompt.
-- **Exit 0 with no decision**: fall through to user prompt.
-- **Exit 2**: denies the permission and shows stderr to Claude. We deliberately avoid this — all rejections fall through silently via empty stdout + exit 0.
-- **Stderr**: ignored by Claude Code (unless exit 2), safe for debug logging.
+}
+```
 
-Note: this hook will only fire for Bash commands that were not already resolved by declarative allow/deny rules in `settings.json`. If you have `permissions.allow` entries for Bash commands, those will be auto-approved before this hook runs.
+### Fall-through (no approval)
+
+For both events: output nothing on stdout + exit 0.
+- **PreToolUse**: falls through to the permission system (deny/allow/ask rules still apply, then PermissionRequest if needed).
+- **PermissionRequest**: the interactive permission dialog is shown to the user.
+
+### Exit codes
+
+- **Exit 0**: success. Stdout parsed for JSON. If empty or no decision → fall through.
+- **Exit 2**: blocking error. Blocks/denies the tool call. stderr fed to Claude. We deliberately avoid this — all rejections fall through silently.
+- **Other (1, etc.)**: non-blocking error. stderr shown in verbose mode only. Falls through.
+- **Stderr**: ignored by Claude Code (unless exit 2), safe for debug logging.
 
 ## Wiring
 
-In `.claude/settings.json` or `~/.claude/settings.json`:
+In `.claude/settings.json` or `~/.claude/settings.json`. Choose one:
+
+**Option A: PermissionRequest (recommended)** — fires only when declarative rules didn't resolve. Less overhead, plays well with `permissions.allow`/`permissions.deny`.
 
 ```json
 {
@@ -290,6 +339,28 @@ In `.claude/settings.json` or `~/.claude/settings.json`:
   }
 }
 ```
+
+**Option B: PreToolUse** — fires on every Bash call. Single source of truth, bypasses declarative rules for approved commands.
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /absolute/path/to/readonly_bash_hook.py"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The same script handles both — it reads `hook_event_name` from stdin and formats the output accordingly. Do not wire to both events simultaneously (redundant; if PreToolUse approves, PermissionRequest never fires).
 
 ## Debug logging
 
