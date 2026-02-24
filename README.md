@@ -31,11 +31,9 @@ cp readonly_bash_hook.py ~/.claude/hooks/readonly_bash_hook.py
 
 Add the hook to your `settings.json` — either project-level (`.claude/settings.json`) or global (`~/.claude/settings.json`).
 
-You have two hook event options:
+You have two hook event options — see [Choosing a hook event](#choosing-a-hook-event) below for trade-offs.
 
 #### Option A: `PermissionRequest` (recommended)
-
-Fires only when Claude Code would show a permission dialog. Lower overhead — the hook is only invoked when needed.
 
 ```json
 {
@@ -57,8 +55,6 @@ Fires only when Claude Code would show a permission dialog. Lower overhead — t
 
 #### Option B: `PreToolUse`
 
-Fires on every Bash tool call, before execution. Gives visibility into every command, but runs on already-approved commands too.
-
 ```json
 {
   "hooks": {
@@ -76,6 +72,32 @@ Fires on every Bash tool call, before execution. Gives visibility into every com
   }
 }
 ```
+
+### Choosing a hook event
+
+Claude Code's permission evaluation order is: **PreToolUse hooks → Deny rules → Allow rules → Ask rules → PermissionRequest hooks → canUseTool**.
+
+The hook auto-detects the event from `hook_event_name` in the stdin JSON. Core logic is identical — only the output format differs.
+
+| Aspect | `PermissionRequest` | `PreToolUse` |
+|--------|---------------------|--------------|
+| **When it fires** | Only when the permission dialog would show | Before *every* Bash tool call |
+| **Decision model** | 2-way: `allow` / `deny` | 3-way: `allow` / `deny` / `ask` |
+| **On empty output (exit 0)** | Shows the permission dialog | Falls through to the permission system |
+| **Overhead** | Low — only invoked for commands not already resolved by declarative rules | Higher — invoked on every call, including already-approved commands |
+| **Interaction with `permissions.allow` / `permissions.deny`** | Complementary — declarative rules resolve first, hook handles the rest | Hook runs first — can approve commands before declarative rules even see them |
+
+**Use `PermissionRequest`** (recommended) when:
+- You have existing `permissions.allow` / `permissions.deny` rules and want the hook to handle whatever falls through
+- You want minimal overhead — the hook only runs when Claude would otherwise ask you
+- You want a simple mental model: declarative rules first, hook as a fallback
+
+**Use `PreToolUse`** when:
+- You want the hook to be the single source of truth for all Bash approvals
+- You want visibility into every command (e.g., for audit logging via `READONLY_HOOK_DEBUG`)
+- You don't use declarative permission rules and want all decisions in one place
+
+Do **not** wire to both events simultaneously — it's redundant and the hook would run twice on commands that reach PermissionRequest.
 
 #### Alternative: Run as a Python module
 
