@@ -270,6 +270,54 @@ def test_git_local_writes(command, expected, description, cfg_git):
 
 
 # ---------------------------------------------------------------------------
+# Feature-flag-dependent: DOCKER SUBCOMMAND WHITELIST
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def cfg_docker():
+    return build_config(subcommand_whitelist={
+        "docker": ["ps", "images", "inspect", "logs", "info", "version"],
+    })
+
+
+DOCKER_SUBCOMMAND_CASES = [
+    # APPROVE — whitelisted subcommands
+    ("docker ps", APPROVE, "docker ps"),
+    ("docker images", APPROVE, "docker images"),
+    ("docker inspect foo", APPROVE, "docker inspect with arg"),
+    ("docker logs my-ctr", APPROVE, "docker logs with arg"),
+    ("docker info", APPROVE, "docker info"),
+    ("docker version", APPROVE, "docker version"),
+
+    # APPROVE — leading global flags (flag-skipping heuristic)
+    ("docker --debug ps", APPROVE, "docker --debug flag before subcommand"),
+
+    # FALLTHROUGH — non-whitelisted subcommands
+    ("docker rm foo", FALLTHROUGH, "docker rm not whitelisted"),
+    ("docker run nginx", FALLTHROUGH, "docker run not whitelisted"),
+    ("docker exec -it ctr sh", FALLTHROUGH, "docker exec not whitelisted"),
+
+    # FALLTHROUGH — bare docker / redirect
+    ("docker", FALLTHROUGH, "bare docker no subcommand"),
+    ("docker > out.txt", FALLTHROUGH, "docker with output redirect"),
+
+    # Pipelines
+    ("docker ps | grep nginx", APPROVE, "pipeline: docker ps piped to grep"),
+    ("docker ps | rm foo", FALLTHROUGH, "pipeline: safe docker ps but unsafe rm"),
+
+    # Git defaults still work with docker config
+    ("git log", APPROVE, "git log still approved with docker config"),
+]
+
+
+@pytest.mark.feature_docker_subcommands
+@pytest.mark.parametrize("command, expected, description", DOCKER_SUBCOMMAND_CASES)
+def test_docker_subcommands(command, expected, description, cfg_docker):
+    result = evaluate_command(command, cfg_docker)
+    assert result == expected, f"DOCKER: {description!r}: {command!r}"
+
+
+# ---------------------------------------------------------------------------
 # Heredoc handling (if bashlex supports it)
 # ---------------------------------------------------------------------------
 

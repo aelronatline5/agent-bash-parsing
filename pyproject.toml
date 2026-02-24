@@ -15,6 +15,7 @@ markers = [
     "fallthrough: commands expected to fall through",
     "feature_git_local_writes: requires GIT_LOCAL_WRITES=True",
     "feature_awk_safe_mode: requires AWK_SAFE_MODE=True",
+    "feature_docker_subcommands: requires docker subcommand_whitelist config",
     "slow: marks tests as slow (e.g., subprocess E2E)",
 ]
 
