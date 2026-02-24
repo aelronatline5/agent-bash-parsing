@@ -150,7 +150,7 @@ from .pipeline import (  # noqa: E402
     step1_redirections,
     step2_normalize,
     step3_never_approve,
-    step5_git,
+    step5_subcommands,
     step6_whitelist,
     step7_default,
     evaluate_fragments,
@@ -179,7 +179,7 @@ __all__ = [
     "handle_sed", "handle_find", "handle_xargs", "handle_awk",
     # Pipeline
     "step1_redirections", "step2_normalize", "step3_never_approve",
-    "step5_git", "step6_whitelist", "step7_default",
+    "step5_subcommands", "step6_whitelist", "step7_default",
     "evaluate_fragments", "evaluate_command",
     # Output
     "format_pretooluse_approval", "format_permission_request_approval",

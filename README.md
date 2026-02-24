@@ -143,11 +143,16 @@ Configuration lives inside Claude Code's `settings.json` under the `readonlyBash
 {
   "hooks": { "..." : "..." },
   "readonlyBashHook": {
-    "extraCommands": ["kubectl", "helm", "terraform", "gcloud"],
+    "extraCommands": ["terraform", "gcloud"],
     "removeCommands": [],
     "features": {
       "gitLocalWrites": false,
       "awkSafeMode": false
+    },
+    "subcommandWhitelist": {
+      "docker": ["ps", "images", "inspect", "logs", "port", "top", "stats", "diff", "history", "info", "version"],
+      "kubectl": ["get", "describe", "logs", "top", "api-resources", "api-versions", "cluster-info", "explain", "version"],
+      "systemctl": ["status", "list-units", "list-unit-files", "is-active", "is-enabled", "show"]
     }
   }
 }
@@ -161,6 +166,7 @@ Configuration lives inside Claude Code's `settings.json` under the `readonlyBash
 | `removeCommands` | `string[]` | `[]` | Commands to remove from the default whitelist |
 | `features.gitLocalWrites` | `bool` | `false` | Auto-approve local git write subcommands (`add`, `branch`, `tag`, `remote`, `stash`, `config`). `git config --global` and `--system` are still rejected. |
 | `features.awkSafeMode` | `bool` | `false` | Instead of rejecting all awk invocations, analyze the awk program and only reject if it contains `system()`, pipes, output redirects, or uses `-f`. |
+| `subcommandWhitelist` | `object` | `{}` | Map of executable names to allowed subcommand lists. See [Subcommand whitelisting](#subcommand-whitelisting) below. |
 
 ### How config is read
 
@@ -171,19 +177,53 @@ The hook checks two locations at startup, in order:
 
 The first file found wins. The hook extracts the `readonlyBashHook` key and falls back to defaults for any missing field.
 
+### Subcommand whitelisting
+
+Commands like `docker`, `kubectl`, `helm`, and `systemctl` follow the same pattern as `git`: the executable itself is neither safe nor unsafe — it depends on the **subcommand**. Use `subcommandWhitelist` to declare read-only subcommands for any tool without writing code.
+
+```json
+{
+  "readonlyBashHook": {
+    "subcommandWhitelist": {
+      "docker": ["ps", "images", "inspect", "logs", "info", "version"],
+      "kubectl": ["get", "describe", "logs", "top", "version"]
+    }
+  }
+}
+```
+
+**How it works:**
+
+- `docker ps` → subcommand `ps` is in the allowed list → **APPROVE**
+- `docker --debug ps` → leading flags are skipped, subcommand `ps` found → **APPROVE**
+- `docker rm foo` → subcommand `rm` not in the allowed list → **falls through**
+- `docker` (bare, no subcommand) → **falls through**
+
+Git's read-only subcommands (`log`, `diff`, `status`, etc.) are always present as the default entry for `"git"`. User entries for `"git"` are **added** to the defaults, not replacing them. Other executables have no defaults — you declare exactly the subcommands you want.
+
+**Subcommand extraction:** For git, the hook uses specialized flag parsing that understands git's global flags (`-C`, `-c`, `--git-dir`, etc.). For all other commands, a simple heuristic is used: skip leading `-`-prefixed arguments, and take the first non-flag argument as the subcommand.
+
+**Caveat:** The simple heuristic does not handle global flags that consume a positional argument (e.g., `docker -H host ps` would misidentify `host` as the subcommand). If you use tools with such flags, avoid passing them in commands that need auto-approval. A dedicated handler can be added for tools that need precise flag parsing.
+
+**Interaction with other config:** Executables in `subcommandWhitelist` are fully handled by the subcommand check (step 5) — they return APPROVE or fall through, never continue to the general whitelist. They should **not** also be in `extraCommands`.
+
 ### Programmatic / test use
 
 ```python
 from readonly_bash_hook import build_config, evaluate_command, APPROVE
 
 config = build_config(
-    extra_commands=["kubectl", "helm"],
+    extra_commands=["terraform"],
     git_local_writes=True,
     awk_safe_mode=False,
+    subcommand_whitelist={
+        "docker": ["ps", "images", "inspect"],
+        "kubectl": ["get", "describe", "logs"],
+    },
 )
 
-result = evaluate_command("kubectl get pods", config)
-assert result is APPROVE
+assert evaluate_command("docker ps", config) is APPROVE
+assert evaluate_command("kubectl get pods", config) is APPROVE
 ```
 
 ## Default whitelist
@@ -244,7 +284,7 @@ class CommandFragment:
 | 2 | `step2_normalize` | Resolve `basename`, unwrap wrappers (`env`, `nice`, `time`, `command`, `nohup`). **APPROVE** for `command -v/-V`. |
 | 3 | `step3_never_approve` | **REJECT** if in never-approve list (shells, interpreters, `eval`, `sudo`, etc.) |
 | 4 | *(handlers)* | Dispatch to registered handler (sed, find, xargs, awk). **REJECT** on dangerous mode, **PASS** to continue. |
-| 5 | `step5_git` | Git subcommand analysis. **APPROVE** read-only subs; **APPROVE** local-write subs if enabled; **REJECT** otherwise. |
+| 5 | `step5_subcommands` | Subcommand whitelist check (git + user-configured commands). **APPROVE** if subcommand is in allowed set; **REJECT** otherwise. Git uses specialized flag parsing; others use simple flag-skipping heuristic. |
 | 6 | `step6_whitelist` | **APPROVE** if executable is in effective whitelist |
 | 7 | `step7_default` | **REJECT** (anything not explicitly approved) |
 

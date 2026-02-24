@@ -18,7 +18,7 @@ from readonly_bash_hook import (
     REJECT,
     NEXT,
     CommandFragment,
-    step5_git,
+    step5_subcommands,
 )
 
 
@@ -35,13 +35,13 @@ GIT_READONLY_SUBCMDS = [
 @pytest.mark.parametrize("subcmd", GIT_READONLY_SUBCMDS)
 def test_git_readonly_approved(subcmd):
     frag = CommandFragment("git", [subcmd], False)
-    assert step5_git(frag, git_local_writes=False) == APPROVE
+    assert step5_subcommands(frag, git_local_writes=False) == APPROVE
 
 
 @pytest.mark.parametrize("subcmd", GIT_READONLY_SUBCMDS)
 def test_git_readonly_approved_with_args(subcmd):
     frag = CommandFragment("git", [subcmd, "--oneline", "HEAD~3"], False)
-    assert step5_git(frag, git_local_writes=False) == APPROVE
+    assert step5_subcommands(frag, git_local_writes=False) == APPROVE
 
 
 # ---------------------------------------------------------------------------
@@ -70,7 +70,7 @@ def test_git_readonly_approved_with_args(subcmd):
 ])
 def test_git_global_flags(args, expected_result):
     frag = CommandFragment("git", args, False)
-    assert step5_git(frag, git_local_writes=False) == expected_result
+    assert step5_subcommands(frag, git_local_writes=False) == expected_result
 
 
 # ---------------------------------------------------------------------------
@@ -79,14 +79,14 @@ def test_git_global_flags(args, expected_result):
 
 def test_git_no_subcommand():
     frag = CommandFragment("git", [], False)
-    assert step5_git(frag, git_local_writes=False) == REJECT
+    assert step5_subcommands(frag, git_local_writes=False) == REJECT
 
 
 def test_git_only_global_flags():
     """All args consumed by global flags, no subcommand left."""
     frag = CommandFragment("git", ["--no-pager"], False)
     # --no-pager is a flag, no subcommand follows
-    assert step5_git(frag, git_local_writes=False) == REJECT
+    assert step5_subcommands(frag, git_local_writes=False) == REJECT
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +96,7 @@ def test_git_only_global_flags():
 @pytest.mark.parametrize("subcmd", ["unknown", "foo-bar", "anything", "cherry"])
 def test_git_unknown_subcommand(subcmd):
     frag = CommandFragment("git", [subcmd], False)
-    assert step5_git(frag, git_local_writes=False) == REJECT
+    assert step5_subcommands(frag, git_local_writes=False) == REJECT
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +110,7 @@ GIT_LOCAL_WRITES_SUBCMDS = ["branch", "tag", "remote", "stash", "add"]
 def test_git_local_writes_disabled(subcmd):
     """Falls through when GIT_LOCAL_WRITES=False."""
     frag = CommandFragment("git", [subcmd, "arg"], False)
-    assert step5_git(frag, git_local_writes=False) == REJECT
+    assert step5_subcommands(frag, git_local_writes=False) == REJECT
 
 
 @pytest.mark.feature_git_local_writes
@@ -118,7 +118,7 @@ def test_git_local_writes_disabled(subcmd):
 def test_git_local_writes_enabled(subcmd):
     """Approved when GIT_LOCAL_WRITES=True."""
     frag = CommandFragment("git", [subcmd, "arg"], False)
-    assert step5_git(frag, git_local_writes=True) == APPROVE
+    assert step5_subcommands(frag, git_local_writes=True) == APPROVE
 
 
 @pytest.mark.parametrize("args", [
@@ -132,7 +132,7 @@ def test_git_local_writes_enabled(subcmd):
 def test_git_local_writes_specific_args(args):
     """Various local-write invocations approved when flag is on."""
     frag = CommandFragment("git", args, False)
-    assert step5_git(frag, git_local_writes=True) == APPROVE
+    assert step5_subcommands(frag, git_local_writes=True) == APPROVE
 
 
 # ---------------------------------------------------------------------------
@@ -143,27 +143,27 @@ def test_git_local_writes_specific_args(args):
 def test_git_config_local_approved():
     """git config (local) approved when GIT_LOCAL_WRITES=True."""
     frag = CommandFragment("git", ["config", "user.name", "foo"], False)
-    assert step5_git(frag, git_local_writes=True) == APPROVE
+    assert step5_subcommands(frag, git_local_writes=True) == APPROVE
 
 
 @pytest.mark.feature_git_local_writes
 def test_git_config_global_rejected():
     """git config --global always falls through, even with GIT_LOCAL_WRITES."""
     frag = CommandFragment("git", ["config", "--global", "user.name", "foo"], False)
-    assert step5_git(frag, git_local_writes=True) == REJECT
+    assert step5_subcommands(frag, git_local_writes=True) == REJECT
 
 
 @pytest.mark.feature_git_local_writes
 def test_git_config_system_rejected():
     """git config --system always falls through, even with GIT_LOCAL_WRITES."""
     frag = CommandFragment("git", ["config", "--system", "core.editor", "vim"], False)
-    assert step5_git(frag, git_local_writes=True) == REJECT
+    assert step5_subcommands(frag, git_local_writes=True) == REJECT
 
 
 def test_git_config_disabled_flag():
     """git config falls through when GIT_LOCAL_WRITES=False."""
     frag = CommandFragment("git", ["config", "user.name", "foo"], False)
-    assert step5_git(frag, git_local_writes=False) == REJECT
+    assert step5_subcommands(frag, git_local_writes=False) == REJECT
 
 
 # ---------------------------------------------------------------------------
@@ -180,14 +180,14 @@ ALWAYS_FALLTHROUGH = [
 @pytest.mark.parametrize("subcmd", ALWAYS_FALLTHROUGH)
 def test_git_always_fallthrough_default(subcmd):
     frag = CommandFragment("git", [subcmd], False)
-    assert step5_git(frag, git_local_writes=False) == REJECT
+    assert step5_subcommands(frag, git_local_writes=False) == REJECT
 
 
 @pytest.mark.parametrize("subcmd", ALWAYS_FALLTHROUGH)
 def test_git_always_fallthrough_with_flag(subcmd):
     """Even with GIT_LOCAL_WRITES=True, these subcommands fall through."""
     frag = CommandFragment("git", [subcmd], False)
-    assert step5_git(frag, git_local_writes=True) == REJECT
+    assert step5_subcommands(frag, git_local_writes=True) == REJECT
 
 
 # ---------------------------------------------------------------------------
@@ -197,4 +197,4 @@ def test_git_always_fallthrough_with_flag(subcmd):
 @pytest.mark.parametrize("cmd", ["ls", "cat", "grep", "find"])
 def test_non_git_passes(cmd):
     frag = CommandFragment(cmd, [], False)
-    assert step5_git(frag, git_local_writes=False) == NEXT
+    assert step5_subcommands(frag, git_local_writes=False) == NEXT

@@ -207,25 +207,17 @@ def step3_never_approve(
 
 
 # ---------------------------------------------------------------------------
-# Step 5 — APPROVE (domain): git subcommand evaluation
+# Step 5 — APPROVE (domain): subcommand evaluation
 # ---------------------------------------------------------------------------
 
 
-def step5_git(
-    fragment: CommandFragment, config: _Config | None = None, **kwargs
-) -> _Sentinel:
-    if fragment.executable != "git":
-        return NEXT
+def _extract_git_subcommand(args: list[str]) -> tuple[str | None, list[str]]:
+    """Git-specific global flag parsing.
 
-    if config is None:
-        from .config import build_config
-        config = build_config(**kwargs)
-
-    # Extract subcommand, skipping global flags
-    args = fragment.args
+    Returns (subcommand, remaining_args) where remaining_args are the args
+    after the subcommand (used for the --global/--system guard).
+    """
     i = 0
-    subcommand = None
-
     while i < len(args):
         arg = args[i]
         if arg in _GIT_GLOBAL_FLAGS_WITH_ARG:
@@ -237,29 +229,67 @@ def step5_git(
         if arg.startswith("-"):  # pragma: no cover
             i += 1
             continue
-        subcommand = arg
-        break
+        return (arg, args[i + 1 :])
+    return (None, [])
 
-    if subcommand is None:
-        _debug(1, "REJECT: bare git (no subcommand)")
+
+def _extract_subcommand_generic(args: list[str]) -> str | None:
+    """Simple heuristic: skip leading ``-``-prefixed args, return first non-flag arg."""
+    for arg in args:
+        if not arg.startswith("-"):
+            return arg
+    return None
+
+
+def step5_subcommands(
+    fragment: CommandFragment, config: _Config | None = None, **kwargs
+) -> _Sentinel:
+    """Generic subcommand whitelist check.
+
+    Handles git with specialized flag parsing and all other configured
+    executables with a simple flag-skipping heuristic.
+    """
+    if config is None:
+        from .config import build_config
+        config = build_config(**kwargs)
+
+    if fragment.executable not in config.subcommand_whitelist:
+        return NEXT
+
+    allowed = config.subcommand_whitelist[fragment.executable]
+
+    if fragment.executable == "git":
+        subcommand, remaining_args = _extract_git_subcommand(fragment.args)
+
+        if subcommand is None:
+            _debug(1, "REJECT: bare git (no subcommand)")
+            return REJECT
+
+        if subcommand in allowed:
+            # Guard: reject git config --global/--system even with local writes
+            if config.git_local_writes and subcommand == "config":
+                for a in remaining_args:
+                    if a in ("--global", "--system"):
+                        _debug(1, "REJECT: git config %s", a)
+                        return REJECT
+            _debug(1, "APPROVE: git subcommand: %s", subcommand)
+            return APPROVE
+
+        _debug(1, "REJECT: git non-readonly: %s", subcommand)
         return REJECT
 
-    if subcommand in GIT_READONLY:
-        _debug(1, "APPROVE: git readonly: %s", subcommand)
+    # Non-git executable
+    subcommand = _extract_subcommand_generic(fragment.args)
+
+    if subcommand is None:
+        _debug(1, "REJECT: bare %s (no subcommand)", fragment.executable)
+        return REJECT
+
+    if subcommand in allowed:
+        _debug(1, "APPROVE: %s subcommand: %s", fragment.executable, subcommand)
         return APPROVE
 
-    if config.git_local_writes and subcommand in GIT_LOCAL_WRITES_CMDS:
-        if subcommand == "config":
-            # Guard: reject --global and --system
-            remaining_args = args[i + 1 :]
-            for a in remaining_args:
-                if a in ("--global", "--system"):
-                    _debug(1, "REJECT: git config %s", a)
-                    return REJECT
-        _debug(1, "APPROVE: git local-write: %s", subcommand)
-        return APPROVE
-
-    _debug(1, "REJECT: git non-readonly: %s", subcommand)
+    _debug(1, "REJECT: %s non-whitelisted subcommand: %s", fragment.executable, subcommand)
     return REJECT
 
 
@@ -328,8 +358,8 @@ def _evaluate_single_fragment(fragment: CommandFragment, config: _Config) -> _Se
             return REJECT
         # PASS → continue to step 5
 
-    # Step 5: git
-    result = step5_git(fragment, config)
+    # Step 5: subcommand whitelist (git + user-configured commands)
+    result = step5_subcommands(fragment, config)
     if result is not NEXT:
         return result
 

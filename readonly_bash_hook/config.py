@@ -9,6 +9,8 @@ from typing import Any, Callable
 
 from . import (
     DEFAULT_COMMANDS,
+    GIT_LOCAL_WRITES_CMDS,
+    GIT_READONLY,
     NEVER_APPROVE,
     PASS,
     REJECT,
@@ -28,6 +30,7 @@ class _Config:
     awk_safe_mode: bool = False
     effective_never_approve: frozenset[str] = field(default_factory=frozenset)
     handlers: dict[str, Callable[..., _Sentinel]] = field(default_factory=dict)
+    subcommand_whitelist: dict[str, frozenset[str]] = field(default_factory=dict)
 
 
 def build_config(
@@ -35,6 +38,7 @@ def build_config(
     remove_commands: list[str] | None = None,
     git_local_writes: bool = False,
     awk_safe_mode: bool = False,
+    subcommand_whitelist: dict[str, list[str]] | None = None,
 ) -> _Config:
     """Build a config from explicit parameters.
 
@@ -65,6 +69,18 @@ def build_config(
         for name in _AWK_VARIANTS:
             handlers[name] = handle_awk
 
+    # Build effective subcommand whitelist — git defaults always present
+    effective_subcmds: dict[str, set[str]] = {"git": set(GIT_READONLY)}
+    if git_local_writes:
+        effective_subcmds["git"] |= GIT_LOCAL_WRITES_CMDS
+    if subcommand_whitelist:
+        for cmd, subs in subcommand_whitelist.items():
+            if cmd in effective_subcmds:
+                effective_subcmds[cmd] |= set(subs)
+            else:
+                effective_subcmds[cmd] = set(subs)
+    frozen_subcmds = {cmd: frozenset(subs) for cmd, subs in effective_subcmds.items()}
+
     return _Config(
         extra_commands=extra_commands,
         remove_commands=remove_commands,
@@ -72,6 +88,7 @@ def build_config(
         awk_safe_mode=awk_safe_mode,
         effective_never_approve=effective_never_approve,
         handlers=handlers,
+        subcommand_whitelist=frozen_subcmds,
     )
 
 
@@ -114,4 +131,5 @@ def load_config_from_settings() -> _Config:  # pragma: no cover
         remove_commands=hook_cfg.get("removeCommands", []),
         git_local_writes=hook_cfg.get("features", {}).get("gitLocalWrites", False),
         awk_safe_mode=hook_cfg.get("features", {}).get("awkSafeMode", False),
+        subcommand_whitelist=hook_cfg.get("subcommandWhitelist"),
     )
