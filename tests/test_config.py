@@ -24,6 +24,8 @@ from readonly_bash_hook import (
     evaluate_command,
     get_effective_whitelist,
     DEFAULT_COMMANDS,
+    GIT_READONLY,
+    GIT_LOCAL_WRITES_CMDS,
 )
 
 
@@ -146,3 +148,50 @@ class TestConfigModuleLoading:
         assert "kubectl" in wl
         # Default commands still present
         assert "ls" in wl
+
+
+# ---------------------------------------------------------------------------
+# Subcommand whitelist config building
+# ---------------------------------------------------------------------------
+
+class TestSubcommandWhitelist:
+    def test_default_has_git(self):
+        """Git readonly subcommands are always in the subcommand whitelist."""
+        cfg = build_config()
+        assert "git" in cfg.subcommand_whitelist
+        assert cfg.subcommand_whitelist["git"] == frozenset(GIT_READONLY)
+
+    def test_git_local_writes_merged(self):
+        """git_local_writes adds local-write subcommands to git's entry."""
+        cfg = build_config(git_local_writes=True)
+        git_subs = cfg.subcommand_whitelist["git"]
+        for sub in GIT_LOCAL_WRITES_CMDS:
+            assert sub in git_subs
+        for sub in GIT_READONLY:
+            assert sub in git_subs
+
+    def test_new_executable_added(self):
+        """User-provided executable creates a new entry."""
+        cfg = build_config(subcommand_whitelist={"docker": ["ps", "images"]})
+        assert "docker" in cfg.subcommand_whitelist
+        assert cfg.subcommand_whitelist["docker"] == frozenset(["ps", "images"])
+
+    def test_user_git_subs_merged_not_replaced(self):
+        """User entries for git are added to defaults, not replacing."""
+        cfg = build_config(subcommand_whitelist={"git": ["custom-cmd"]})
+        git_subs = cfg.subcommand_whitelist["git"]
+        assert "custom-cmd" in git_subs
+        # Defaults still present
+        for sub in GIT_READONLY:
+            assert sub in git_subs
+
+    def test_multiple_executables(self):
+        """Multiple user-provided executables all appear."""
+        cfg = build_config(subcommand_whitelist={
+            "docker": ["ps"],
+            "kubectl": ["get", "describe"],
+        })
+        assert cfg.subcommand_whitelist["docker"] == frozenset(["ps"])
+        assert cfg.subcommand_whitelist["kubectl"] == frozenset(["get", "describe"])
+        # git still present
+        assert "git" in cfg.subcommand_whitelist

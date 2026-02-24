@@ -198,3 +198,49 @@ def test_git_always_fallthrough_with_flag(subcmd):
 def test_non_git_passes(cmd):
     frag = CommandFragment(cmd, [], False)
     assert step5_subcommands(frag, git_local_writes=False) == NEXT
+
+
+# ---------------------------------------------------------------------------
+# Non-git subcommand whitelisting (generic path)
+# ---------------------------------------------------------------------------
+
+from readonly_bash_hook import build_config
+
+
+def _docker_config():
+    return build_config(subcommand_whitelist={"docker": ["ps", "images", "inspect"]})
+
+
+def test_generic_subcommand_approved():
+    frag = CommandFragment("docker", ["ps"], False)
+    assert step5_subcommands(frag, _docker_config()) == APPROVE
+
+
+def test_generic_subcommand_with_flags():
+    """Leading flags are skipped, subcommand found."""
+    frag = CommandFragment("docker", ["--debug", "ps"], False)
+    assert step5_subcommands(frag, _docker_config()) == APPROVE
+
+
+def test_generic_subcommand_rejected():
+    """Subcommand not in allowed set → REJECT."""
+    frag = CommandFragment("docker", ["rm", "foo"], False)
+    assert step5_subcommands(frag, _docker_config()) == REJECT
+
+
+def test_generic_bare_command_rejected():
+    """Bare command with no subcommand → REJECT."""
+    frag = CommandFragment("docker", [], False)
+    assert step5_subcommands(frag, _docker_config()) == REJECT
+
+
+def test_generic_only_flags_rejected():
+    """Only flags, no subcommand → REJECT."""
+    frag = CommandFragment("docker", ["--debug", "-v"], False)
+    assert step5_subcommands(frag, _docker_config()) == REJECT
+
+
+def test_generic_not_configured_passes():
+    """Executable not in subcommand whitelist → NEXT."""
+    frag = CommandFragment("helm", ["install"], False)
+    assert step5_subcommands(frag, _docker_config()) == NEXT
