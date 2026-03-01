@@ -56,7 +56,7 @@ The hook **never denies** — it either auto-approves or silently defers to the 
 
 **Never block, only approve or defer.** The hook never uses exit code 2 (hard deny). Every rejection is a silent fall-through. This is the same principle as [agent-tooluse-auditor](https://github.com/aelronatline5/agent-tooluse-auditor): the human is always the final authority, and automation only removes friction for obviously safe operations.
 
-**Default-deny for commands.** Any command not explicitly whitelisted falls through at step 7. The whitelist is opt-in: ~60 commands ship by default, and you can add more via config. But the default answer is always "ask the human."
+**Default-deny for commands.** Any command not explicitly whitelisted falls through at step 7. The whitelist is opt-in: ~70 commands ship by default, and you can add more via config. But the default answer is always "ask the human."
 
 **Security invariants are code, not config.** The never-approve list (shells, interpreters, `eval`, `sudo`), wrapper command handling, and handler dispatch logic are hardcoded. These aren't user preferences — they're escape hatches that can bypass the entire safety model. You can add commands to the whitelist, but you can't remove `bash` from the never-approve list via a JSON key.
 
@@ -182,19 +182,20 @@ This requires `readonly_bash_hook/` to be on `PYTHONPATH` or in the current dire
 - Command/process substitution: `diff <(sort a) <(sort b)`
 - `sed` without `-i`: `sed 's/foo/bar/' file` (read-only transform to stdout)
 - `find` without `-exec`/`-delete`: `find . -name "*.py" -type f`
-- `find -exec` with safe inner commands: `find . -exec grep foo {} \;`
+- `find -exec`/`-execdir`/`-ok`/`-okdir` with safe inner commands: `find . -exec grep foo {} \;`
 - `xargs` with safe inner commands: `ls | xargs wc -l`
-- Git read-only subcommands: `git log`, `git diff`, `git status`, `git blame`
+- Git read-only subcommands: `git log`, `git diff`, `git status`, `git blame`, `git show`, `git rev-parse`, `git ls-files`, `git ls-tree`, `git show-ref`
 - Wrapper commands are unwrapped: `env FOO=bar ls`, `nice -n5 cat file`, `command -v git`
 
 ## What falls through to user prompt
 
 - Write commands: `rm`, `cp`, `mv`, `mkdir`, `touch`, `chmod`
-- Interpreters/shells: `python3`, `bash`, `node`, `perl`, `ruby`
-- Shell escape hatches: `eval`, `exec`, `source`, `sudo`
+- Interpreters/shells: `python`, `python3`, `bash`, `sh`, `zsh`, `fish`, `dash`, `csh`, `ksh`, `node`, `deno`, `bun`, `perl`, `ruby`
+- Shell escape hatches: `eval`, `exec`, `source`, `.`, `sudo`, `su`
+- Too flexible to parse: `parallel`
 - Output redirections: `ls > file.txt`, `echo foo >> bar`
 - `sed -i` (in-place editing)
-- `find -delete`, `find -fprint`
+- `find -delete`, `find -fprint`, `find -fprint0`, `find -fprintf`
 - Git write subcommands: `git push`, `git commit`, `git merge`
 - `awk` (by default — has `system()` for arbitrary execution; see `awkSafeMode` below)
 - Anything not on the whitelist
@@ -294,7 +295,7 @@ assert evaluate_command("kubectl get pods", config) is APPROVE
 
 ## Default whitelist
 
-~60 commands are approved out of the box:
+~70 commands are approved out of the box:
 
 | Category | Commands |
 |----------|----------|
@@ -356,7 +357,7 @@ class CommandFragment:
 | 1 | `step1_redirections` | **REJECT** if output redirect detected (`>`, `>>`, `>&file`) |
 | 2 | `step2_normalize` | Resolve `basename`, unwrap wrappers (`env`, `nice`, `time`, `command`, `nohup`). **APPROVE** for `command -v/-V`. |
 | 3 | `step3_never_approve` | **REJECT** if in never-approve list (shells, interpreters, `eval`, `sudo`, etc.) |
-| 4 | *(handlers)* | Dispatch to registered handler (sed, find, xargs, awk). **REJECT** on dangerous mode, **PASS** to continue. |
+| 4 | *(handlers)* | Dispatch to registered handler (sed, find, xargs; awk when `awkSafeMode` is on). **REJECT** on dangerous mode, **PASS** to continue. |
 | 5 | `step5_subcommands` | Subcommand whitelist check (git + user-configured commands). **APPROVE** if subcommand is in allowed set; **REJECT** otherwise. Git uses specialized flag parsing; others use simple flag-skipping heuristic. |
 | 6 | `step6_whitelist` | **APPROVE** if executable is in effective whitelist |
 | 7 | `step7_default` | **REJECT** (anything not explicitly approved) |
@@ -441,7 +442,7 @@ uv run pytest
 uv run pytest --cov=readonly_bash_hook --cov-report=term-missing
 ```
 
-636 tests, 99% coverage. The test suite was written independently from the briefing spec, and the implementation was built against the spec without reading test internals — the tests serve as black-box validation.
+662 tests, 99% coverage. The test suite was written independently from the briefing spec, and the implementation was built against the spec without reading test internals — the tests serve as black-box validation.
 
 ## License
 
